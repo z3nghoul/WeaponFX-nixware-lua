@@ -374,9 +374,20 @@ struct Classified {
     int count[kTargets];
 };
 
-// The viewmodel's depth pass without the marked items. True when it issued
-// the call itself (or skipped it: nothing but them was in it).
-std::atomic<bool> g_ViewmodelHasHands{false};
+// The colour pass delivers the viewmodel as a run of count=1 calls, one thread
+// per run, in an order that is not fixed (seen: Weapon, Hands, Sleeves, Gloves,
+// Gloves; the code was once written for Sleeves, Gloves, Gloves, Weapon, Hands).
+// The queue below holds a run back and draws it inside out at the run's last
+// call. The last call is found from the length of the previous runs, never from
+// a target: a run that is cut short or late is dropped, not drawn - its
+// pointers belong to a pass that is over.
+std::atomic<int> g_RunFirst{-1};     // target that opened the last run
+std::atomic<int> g_RunLength{0};     // calls in the last complete run (0: not learnt yet)
+thread_local int g_RunCount = 0;     // calls of the run in progress on this thread
+thread_local LONGLONG g_LastCallTick = 0;
+constexpr LONGLONG kRunGapMs = 4;    // a pause longer than this opens a new run
+std::atomic<unsigned> g_RunsFlushed{0}, g_RunsDropped{0}, g_RunsGap{0}, g_RunsRepeat{0}, g_RunLenChanges{0};
+std::atomic<ULONGLONG> g_RunLogTick{0};
 
 struct QueuedTarget {
     uint8_t raw[16 * 0x80];
@@ -412,6 +423,12 @@ void FlushQueued(RenderObjectsFn orig, void** result) {
     }
     g_QueuedTotal = 0;
     if (result) *result = lastRes;
+}
+
+// Forget a held run without drawing it.
+void DropQueued() {
+    for (QueuedTarget& q : g_Queued) q.count = 0;
+    g_QueuedTotal = 0;
 }
 
 bool StripMarked(RenderObjectsFn orig, void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7,
@@ -500,6 +517,7 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
     if (!items || !L || count <= 0 || count > kMaxItems || !ReadMem((uintptr_t)L + kPassViewBits, &view, 8) ||
         !(view & kViewIsViewmodel) || !ReadMem((uintptr_t)L + kPassLflags, &lflags, 4))
         return false;
+    WeaponFx::SetViewmodelPass(true);   // cleared by the hook's guard when the call returns
     void* marker[kTargets] = {};
     Mode mode[kTargets] = {};
     unsigned on = 0;
@@ -535,24 +553,16 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         if (!any) return false;
     }
     if (lflags & kLflagDepth) {
-        if (cl.count[WeaponFx::kHands] > 0) g_ViewmodelHasHands.store(true, std::memory_order_relaxed);
         if (!on) return false;
         int8_t strip[kMaxItems];
         for (int i = 0; i < count; ++i) strip[i] = (int8_t)(cl.target[i] >= 0 && (on >> cl.target[i] & 1u));
         return StripMarked(orig, p1, p2, items, count, p5, L, p7, strip, result);
     }
-    if (cl.count[WeaponFx::kHands] > 0) g_ViewmodelHasHands.store(true, std::memory_order_relaxed);
-    if (cl.count[WeaponFx::kSleeves] > 0 && g_Queued[kWeapon].count > 0) {
-        // Previous frame's queue was never flushed by a Hands pass (this agent
-        // has no bare hands mesh); flush it now and stop waiting for Hands.
-        g_ViewmodelHasHands.store(false, std::memory_order_relaxed);
-        FlushQueued(orig, nullptr);
-    }
     for (int t = 0; t < kTargets; ++t)
         if (first[t] >= 0) NoteModel(t, base + (size_t)first[t] * g_Stride);
     NoteItemModels(base, count, cl.target);
     if (!on) {
-        if (g_QueuedTotal > 0) FlushQueued(orig, nullptr);
+        if (g_QueuedTotal > 0) DropQueued();
         return false;
     }
     unsigned replace = 0, overlay = 0;
@@ -561,12 +571,38 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         const bool asReplace = mode[t] == Mode::Replace || WeaponFx::ReadsScene(t);
         (asReplace ? replace : overlay) |= 1u << t;
     }
-    // In CS2 scenesystem, the 5 viewmodel items arrive in 5 separate count=1
-    // calls in the order: Sleeves (#1), Gloves (#2, #3), Weapon (#4), Hands (#5).
-    // Queue them into the 4 target buckets and flush in the physical inside-out
-    // order: 1. Hands -> 2. Gloves -> 3. Sleeves -> 4. Weapon.
+    // The viewmodel items arrive as separate count=1 calls (see g_RunLength).
+    // Queue them into the 4 target buckets and flush at the run's last call in
+    // the physical inside-out order: Hands -> Gloves -> Sleeves -> Weapon.
     if (count == 1 && cl.target[0] >= 0 && g_Stride <= 0x80) {
         const int t = cl.target[0];
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        const bool gap = g_LastCallTick == 0 || (now.QuadPart - g_LastCallTick) * 1000 > freq.QuadPart * kRunGapMs;
+        g_LastCallTick = now.QuadPart;
+        const int runFirst = g_RunFirst.load(std::memory_order_relaxed);
+        if (gap || (t == runFirst && t != kGloves && g_RunCount > 0)) {   // a new run begins
+            (gap ? g_RunsGap : g_RunsRepeat).fetch_add(1, std::memory_order_relaxed);
+            if (g_RunCount > 0) {
+                if (g_RunLength.exchange(g_RunCount, std::memory_order_relaxed) != g_RunCount)
+                    g_RunLenChanges.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_RunCount = 0;
+            g_RunFirst.store(t, std::memory_order_relaxed);
+            if (g_QueuedTotal > 0) {   // the old run was cut short
+                DropQueued();
+                g_RunsDropped.fetch_add(1, std::memory_order_relaxed);
+            }
+            const ULONGLONG tick = GetTickCount64();
+            if (tick - g_RunLogTick.load(std::memory_order_relaxed) >= 2000) {
+                g_RunLogTick.store(tick, std::memory_order_relaxed);
+                Log("runs: flushed %u dropped %u | starts by gap %u by repeat %u | length %d (changed %u times) | thread %lu",
+                    g_RunsFlushed.load(), g_RunsDropped.load(), g_RunsGap.load(), g_RunsRepeat.load(),
+                    g_RunLength.load(), g_RunLenChanges.load(), GetCurrentThreadId());
+            }
+        }
+        ++g_RunCount;
         QueuedTarget& q = g_Queued[t];
         if (q.count < 16 && ReadMem(base, q.raw + (size_t)q.count * g_Stride, g_Stride)) {
             uint8_t* m = q.marked + (size_t)q.count * g_Stride;
@@ -584,9 +620,9 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
             q.p1 = p1; q.p2 = p2; q.p5 = p5; q.L = L; q.p7 = p7;
             ++q.count;
             ++g_QueuedTotal;
-            const bool hasHands = g_ViewmodelHasHands.load(std::memory_order_relaxed);
-            const bool isLast = hasHands ? (t == WeaponFx::kHands) : (t == kWeapon);
-            if (isLast) {
+            const int runLength = g_RunLength.load(std::memory_order_relaxed);
+            if (runLength > 0 && g_RunCount >= runLength) {
+                g_RunsFlushed.fetch_add(1, std::memory_order_relaxed);
                 FlushQueued(orig, result);
             } else {
                 *result = nullptr;
@@ -603,7 +639,10 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
 void* __fastcall HkRenderObjects(void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7) {
     struct Guard {
         Guard() { g_InHook.fetch_add(1, std::memory_order_acquire); }
-        ~Guard() { g_InHook.fetch_sub(1, std::memory_order_release); }
+        ~Guard() {
+            WeaponFx::SetViewmodelPass(false);
+            g_InHook.fetch_sub(1, std::memory_order_release);
+        }
     } guard;
     const RenderObjectsFn orig = (RenderObjectsFn)g_Det.orig;
     void* r = nullptr;

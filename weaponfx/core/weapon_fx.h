@@ -140,6 +140,11 @@ bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t
 // effect that reads the scene gets no pass of the weapon's own (it turned the
 // see-through black): the fingers, drawn first, still hide it.
 void SetViewmodelDepth(bool on);
+// The calling thread is inside a RenderObjects call of the viewmodel (set by
+// the engine hook, cleared when it returns). Only draws made there are the
+// viewmodel's; any other draw in the same frame - the cheat's chams and glow
+// of enemies above all - is left on its own depth and state.
+void SetViewmodelPass(bool on);
 
 // Saved engine state between Begin and End.
 struct Bound {

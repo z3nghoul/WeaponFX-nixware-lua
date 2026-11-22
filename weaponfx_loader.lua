@@ -316,36 +316,12 @@ end
 -- DLL -----------------------------------------------------------------------
 
 local load_failed = false
-local pending_reload = false
 local next_try = 0
-local staged_mtime = nil
-
-local function file_mtime(path)
-    local data = ffi.new('WFX_FIND_DATAA')
-    local h = C.FindFirstFileA(path, data)
-    if ffi.cast('intptr_t', h) == -1 then return nil end
-    C.FindClose(h)
-    return ('%08X:%08X'):format(data.ftLastWriteTime.hi, data.ftLastWriteTime.lo)
-end
 
 local function module_handle()
     local h = C.GetModuleHandleA(DLL_NAME)
     if h == nil then return nil end
     return h
-end
-
-local STAGED_DLL = '' -- dev-only: path to a freshly built DLL; empty in release
-
-local function apply_staged_dll(target_path)
-    local staged = file_exists(STAGED_DLL) and STAGED_DLL or (target_path .. '.new')
-    local m = file_mtime(staged)
-    if not m or m == staged_mtime then return false end
-    if C.CopyFileA(staged, target_path, 0) ~= 0 then
-        staged_mtime = m
-        log('updated ' .. target_path)
-        return true
-    end
-    return false
 end
 
 local function load_dll()
@@ -381,23 +357,7 @@ events.render(function()
         local now = os.clock()
         if now < next_try then return end
         next_try = now + 1
-        local loaded = module_handle() ~= nil
-        local staged = file_exists(STAGED_DLL) and STAGED_DLL or (DLL_PATH .. '.new')
-        local m = file_mtime(staged)
-        if not staged_mtime then staged_mtime = file_mtime(DLL_PATH) or m end
-        if m and m ~= staged_mtime then
-            if loaded then
-                if not pending_reload then
-                    pending_reload = true
-                    stop_dll()
-                end
-                return
-            end
-            apply_staged_dll(DLL_PATH)
-            pending_reload = false
-            load_failed = false
-        end
-        if not loaded and not load_failed then
+        if not module_handle() and not load_failed then
             load_dll()
         end
     end)

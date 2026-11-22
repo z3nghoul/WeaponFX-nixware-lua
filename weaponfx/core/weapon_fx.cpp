@@ -3029,6 +3029,8 @@ bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t
 }
 
 namespace {
+thread_local bool g_InVmPass = false;   // SetViewmodelPass
+
 bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key) {
     // A marked draw whose target has no shader (the gloves marked while their
     // shader failed to load) is issued as the engine's own, not with ours.
@@ -3063,7 +3065,11 @@ bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uin
     }
     Bound fx;
     ID3D11DepthStencilView* mainDsv = nullptr;
-    if (!InViewmodelRun(c, &mainDsv)) {
+    // A draw that is not ours and not made inside a viewmodel RenderObjects call
+    // is none of the viewmodel's, wherever the run counter stands: the cheat's
+    // enemy chams and glow come after the viewmodel starts and were pointed at
+    // our depth, losing the world behind walls and the stencil of the glow.
+    if ((!weapon && !g_InVmPass) || !InViewmodelRun(c, &mainDsv)) {
         bool drawn = false;
         int why = kWhyOff;
         if (weapon && DrawMissedWeapon(c, target, issue, ctx, &drawn, &why)) return drawn;
@@ -3213,6 +3219,8 @@ void SetDebugBits(unsigned bits) {
     Logf("WeaponFX: debug bits 0x%X", bits);
 }
 unsigned DebugBits() { return g_DebugBits.load(std::memory_order_relaxed); }
+
+void SetViewmodelPass(bool on) { g_InVmPass = on; }
 
 void SetViewmodelDepth(bool on) {
     g_VmDepthOn.store(on, std::memory_order_relaxed);
