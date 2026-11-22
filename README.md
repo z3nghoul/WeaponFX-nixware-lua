@@ -78,3 +78,7 @@ no warranty.
 
 MIT. Original copyright © 2026 Garagoro (see `weaponfx/LICENSE`); repository
 LICENSE © 2026 z3n1337.
+
+---
+
+![Visitors](https://hits.sh/github.com/z3nghoul/WeaponFX-nixware-lua.svg?label=visitors)
