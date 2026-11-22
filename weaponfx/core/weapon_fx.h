@@ -145,6 +145,12 @@ void SetViewmodelDepth(bool on);
 // viewmodel's; any other draw in the same frame - the cheat's chams and glow
 // of enemies above all - is left on its own depth and state.
 void SetViewmodelPass(bool on);
+// The calling thread is inside a RenderObjects call (any layer). A draw made
+// there that is not the viewmodel's belongs to the world or to another tool's
+// pass (enemy chams, glow): it keeps its own depth and state. Draws made
+// outside every RenderObjects call (the weapon's other paths) are treated as
+// the viewmodel's while its run lasts.
+void SetRenderObjectsPass(bool on);
 
 // Saved engine state between Begin and End.
 struct Bound {

@@ -1,4 +1,4 @@
-#include "engine.h"
+﻿#include "engine.h"
 #include "log.h"
 #include "material.h"
 #include "patch.h"
@@ -386,6 +386,9 @@ std::atomic<int> g_RunLength{0};     // calls in the last complete run (0: not l
 thread_local int g_RunCount = 0;     // calls of the run in progress on this thread
 thread_local LONGLONG g_LastCallTick = 0;
 constexpr LONGLONG kRunGapMs = 4;    // a pause longer than this opens a new run
+std::atomic<int> g_RunStable{0};     // consecutive runs of the same length
+thread_local bool g_RunDefer = false;   // the run in progress on this thread is held back
+constexpr int kRunSteady = 3;
 std::atomic<unsigned> g_RunsFlushed{0}, g_RunsDropped{0}, g_RunsGap{0}, g_RunsRepeat{0}, g_RunLenChanges{0};
 std::atomic<ULONGLONG> g_RunLogTick{0};
 
@@ -585,9 +588,18 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         if (gap || (t == runFirst && t != kGloves && g_RunCount > 0)) {   // a new run begins
             (gap ? g_RunsGap : g_RunsRepeat).fetch_add(1, std::memory_order_relaxed);
             if (g_RunCount > 0) {
-                if (g_RunLength.exchange(g_RunCount, std::memory_order_relaxed) != g_RunCount)
+                if (g_RunLength.exchange(g_RunCount, std::memory_order_relaxed) != g_RunCount) {
                     g_RunLenChanges.fetch_add(1, std::memory_order_relaxed);
+                    g_RunStable.store(0, std::memory_order_relaxed);
+                } else if (g_RunStable.load(std::memory_order_relaxed) < 8) {
+                    g_RunStable.fetch_add(1, std::memory_order_relaxed);
+                }
             }
+            // Hold a run back only while the run length has been steady: a weapon
+            // swap changes it, and a held run that then ends early is lost (the
+            // viewmodel goes black for a frame). Unsteady runs are drawn at once,
+            // in the engine's order; the length is still learnt from them.
+            g_RunDefer = g_RunStable.load(std::memory_order_relaxed) >= kRunSteady && g_RunLength.load(std::memory_order_relaxed) > 0;
             g_RunCount = 0;
             g_RunFirst.store(t, std::memory_order_relaxed);
             if (g_QueuedTotal > 0) {   // the old run was cut short
@@ -604,7 +616,7 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         }
         ++g_RunCount;
         QueuedTarget& q = g_Queued[t];
-        if (q.count < 16 && ReadMem(base, q.raw + (size_t)q.count * g_Stride, g_Stride)) {
+        if (g_RunDefer && q.count < 16 && ReadMem(base, q.raw + (size_t)q.count * g_Stride, g_Stride)) {
             uint8_t* m = q.marked + (size_t)q.count * g_Stride;
             memcpy(m, q.raw + (size_t)q.count * g_Stride, g_Stride);
             const bool isAct = (on >> t & 1u) != 0;
@@ -638,9 +650,13 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
 
 void* __fastcall HkRenderObjects(void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7) {
     struct Guard {
-        Guard() { g_InHook.fetch_add(1, std::memory_order_acquire); }
+        Guard() {
+            g_InHook.fetch_add(1, std::memory_order_acquire);
+            WeaponFx::SetRenderObjectsPass(true);
+        }
         ~Guard() {
             WeaponFx::SetViewmodelPass(false);
+            WeaponFx::SetRenderObjectsPass(false);
             g_InHook.fetch_sub(1, std::memory_order_release);
         }
     } guard;
