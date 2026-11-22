@@ -82,16 +82,16 @@ jobs:
             WeaponFX-Nixware.zip
             dist/WeaponFX/WeaponFX.dll
           body: |
-            ### 📥 Установка (Installation)
-            1. Скачайте **`WeaponFX-Nixware.zip`** и распакуйте содержимое прямо в **`C:\nix\scripts\`**:
+            ### Installation
+            1. Download **`WeaponFX-Nixware.zip`** and extract its contents directly into **`C:\nix\scripts\`**:
                - `C:\nix\scripts\weaponfx_loader.lua`
                - `C:\nix\scripts\WeaponFX\WeaponFX.dll`
                - `C:\nix\scripts\WeaponFX\shaders\...`
-            2. Запустите CS2, откройте в меню Nixware **Scripts -> Library** и загрузите **`WeaponFX`**.
-            3. В левой панели меню появится вкладка **`</> WeaponFX`**.
+            2. Start CS2, open **Scripts -> Library** in the Nixware menu and load **`WeaponFX`**.
+            3. A **`</> WeaponFX`** tab will appear in the left panel of the menu.
 
             ---
-            ### 🔒 Проверка подлинности сборки (Built automatically by GitHub Actions)
-            Эта DLL собрана автоматически на серверах GitHub напрямую из исходного кода коммита `${{ github.sha }}` и подписана через **GitHub Artifact Attestation**.
+            ### Build authenticity (built automatically by GitHub Actions)
+            This DLL was built automatically on GitHub's servers directly from the source code of commit `${{ github.sha }}` and signed with **GitHub Artifact Attestation**.
             - **`WeaponFX.dll` SHA-256:** `${{ env.DLL_SHA256 }}`
             - **`WeaponFX-Nixware.zip` SHA-256:** `${{ env.ZIP_SHA256 }}`
