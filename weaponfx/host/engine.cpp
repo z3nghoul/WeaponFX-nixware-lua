@@ -556,12 +556,6 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         for (int n : cl.count) any += n;
         if (!any) return false;
     }
-    if (lflags & kLflagDepth) {
-        if (!on) return false;
-        int8_t strip[kMaxItems];
-        for (int i = 0; i < count; ++i) strip[i] = (int8_t)(cl.target[i] >= 0 && (on >> cl.target[i] & 1u));
-        return StripMarked(orig, p1, p2, items, count, p5, L, p7, strip, result);
-    }
     for (int t = 0; t < kTargets; ++t)
         if (first[t] >= 0) NoteModel(t, base + (size_t)first[t] * g_Stride);
     NoteItemModels(base, count, cl.target);
@@ -697,19 +691,6 @@ size_t DeriveStride(uintptr_t fn) {
 // queue, no guess at where a run ends. (Found 2026-11-22 in scenesystem.dll:
 // sub_f1a40 walks chunk lists, sub_ed390 a flat array; r8 = pass context in
 // both.)
-constexpr short kSigWalkChunks[] = {
-    0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
-    0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
-    0x41, 0x57, 0x48, 0x8D, 0x6C, 0x24, 0xF8, 0x48, 0x81, 0xEC, 0x08, 0x01, 0x00, 0x00, 0x41,
-    0xF6, 0x40, 0x48, 0x01 };
-constexpr short kSigWalkFlat[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57,
-    0x48, 0x83, 0xEC, 0x30, 0x41, 0xF6, 0x40, 0x48, 0x28, 0x49, 0x8B, 0xF9, 0x4D, 0x8B, 0xF0,
-    0x4C, 0x8B, 0xFA, 0x74, 0x76 };
-constexpr size_t kWalkPatchLen = 15;   // both end on an instruction boundary, no RIP-relative operand before it
-using WalkChunksFn = uint64_t(__fastcall*)(void*, void*, void*, void*, void*, void*, void*, void*);
-using WalkFlatFn = uint64_t(__fastcall*)(void*, void*, void*, void*, void*, unsigned);
-Detour g_DetWalkChunks, g_DetWalkFlat;
 std::atomic<unsigned> g_Reordered{0};
 
 // Items of the viewmodel's colour pass in the physical inside-out order:
@@ -755,84 +736,54 @@ void ReorderItems(void* L, const uintptr_t* at, unsigned count) {
         Log("engine: viewmodel list put in order (%u items, %u of them classified), %u so far", count, n, total);
 }
 
+
 struct WalkGuard {
     WalkGuard() { g_InHook.fetch_add(1, std::memory_order_acquire); }
     ~WalkGuard() { g_InHook.fetch_sub(1, std::memory_order_release); }
 };
 
-uint64_t __fastcall HkWalkFlat(void* a1, void* a2, void* L, void* a4, void* items, unsigned count) {
+// The sort of one chunk of items (scenesystem.dll sub_ed4c0: rdx = pass context,
+// r8 = items, r9d = count; called by the chunk walk just before it walks the
+// chunk). The walk's own sort puts the viewmodel in the engine's order, so the
+// reorder has to come after it. The patch goes after the function's first
+// `test r9d, r9d / je` (a relative branch cannot be replayed from a trampoline):
+// at that point the registers and stack are the function's own.
+constexpr short kSigSortChunk[] = {
+    0x45, 0x85, 0xC9, 0x0F, 0x84, -1, -1, -1, -1, 0x55, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x30,
+    0x48, 0x8B, 0x82, 0x48, 0x0B, 0x00, 0x00, 0x49, 0x8B, 0xF0, 0x4C, 0x89, 0x74, 0x24, 0x58 };
+constexpr size_t kSortSkip = 9;         // bytes of `test` + `je` before the patch
+constexpr size_t kSortPatchLen = 14;    // push rbp / push rsi / push rdi / sub rsp, 30h / mov rax, [rdx+0B48h]
+using SortChunkFn = uint64_t(__fastcall*)(void*, void*, void*, unsigned, void*, void*, void*, void*);
+Detour g_DetSortChunk;
+
+uint64_t __fastcall HkSortChunk(void* a1, void* L, void* items, unsigned count, void* a5, void* a6, void* a7, void* a8) {
     WalkGuard guard;
-    if (items && count >= 2 && count <= 64) {
+    const uint64_t r = ((SortChunkFn)g_DetSortChunk.orig)(a1, L, items, count, a5, a6, a7, a8);
+    if (L && items && count >= 2 && count <= 64 && g_Stride != 0 && g_Stride <= 0x80) {
         uintptr_t at[64];
         for (unsigned i = 0; i < count; ++i) at[i] = (uintptr_t)items + (size_t)i * g_Stride;
         ReorderItems(L, at, count);
     }
-    return ((WalkFlatFn)g_DetWalkFlat.orig)(a1, a2, L, a4, items, count);
-}
-
-// The chunk list: { int chunks; ...; chunk** at +8 }, each chunk { int count; ...; items at +8 }.
-uint64_t __fastcall HkWalkChunks(void* a1, void* a2, void* L, void* a4, void* a5, void* list, void* a7, void* a8) {
-    WalkGuard guard;
-    if (L && list) {
-        uint64_t view = 0;
-        if (ReadMem((uintptr_t)L + kPassViewBits, &view, 8) && (view & kViewIsViewmodel)) {
-            int chunks = 0;
-            uintptr_t arr = 0;
-            if (ReadMem((uintptr_t)list, &chunks, 4) && ReadMem((uintptr_t)list + 8, &arr, 8) && arr && chunks > 0 &&
-                chunks <= 16) {
-                uintptr_t at[64];
-                unsigned n = 0;
-                for (int c = 0; c < chunks && n < 64; ++c) {
-                    uintptr_t chunk = 0;
-                    int cnt = 0;
-                    if (!ReadMem(arr + (size_t)c * 8, &chunk, 8) || !chunk || !ReadMem(chunk, &cnt, 4) || cnt <= 0 ||
-                        cnt > 256) {
-                        n = 0;
-                        break;
-                    }
-                    for (int i = 0; i < cnt && n < 64; ++i) at[n++] = chunk + 8 + (size_t)i * g_Stride;
-                }
-                if (n >= 2) ReorderItems(L, at, n);
-            }
-        }
-    }
-    return ((WalkChunksFn)g_DetWalkChunks.orig)(a1, a2, L, a4, a5, list, a7, a8);
+    return r;
 }
 
 void InstallWalkHooks() {
-    constexpr size_t kChunkLen = sizeof(kSigWalkChunks) / sizeof(kSigWalkChunks[0]);
-    constexpr size_t kFlatLen = sizeof(kSigWalkFlat) / sizeof(kSigWalkFlat[0]);
+    constexpr size_t kLen = sizeof(kSigSortChunk) / sizeof(kSigSortChunk[0]);
     int hits = 0;
-    bool over = false;
-    uintptr_t chunks = FindUnique("scenesystem.dll", kSigWalkChunks, kChunkLen, &hits);
-    if (!chunks) {
-        // The cheat's own chams hook sits on this function: an `E9 rel32` over
-        // its first bytes. Same signature with those bytes wild, and go on top.
-        short alt[kChunkLen];
-        for (size_t i = 0; i < kChunkLen; ++i) alt[i] = kSigWalkChunks[i];
-        alt[0] = 0xE9;
-        for (size_t i = 1; i < 5; ++i) alt[i] = -1;
-        int altHits = 0;
-        chunks = FindUnique("scenesystem.dll", alt, kChunkLen, &altHits);
-        if (!chunks) {
-            Log("engine: chunk walk signature matched %d times, with a jmp over it %d times - the viewmodel keeps the call queue",
-                hits, altHits);
-            return;
-        }
-        over = true;
-        Log("engine: chunk walk already starts with a jmp (another tool's detour); going on top of it");
+    const uintptr_t base = FindUnique("scenesystem.dll", kSigSortChunk, kLen, &hits);
+    if (!base) {
+        Log("engine: chunk sort signature matched %d times (need 1) - the viewmodel keeps the call queue", hits);
+        return;
     }
-    const uintptr_t flat = FindUnique("scenesystem.dll", kSigWalkFlat, kFlatLen, &hits);
-    const bool ok = over ? Wfx::InstallOverJmp(g_DetWalkChunks, "ItemWalkChunks", chunks, (void*)&HkWalkChunks)
-                         : Wfx::Install(g_DetWalkChunks, "ItemWalkChunks", chunks, kSigWalkChunks, kWalkPatchLen, -1,
-                                        (void*)&HkWalkChunks);
-    if (flat) Wfx::Install(g_DetWalkFlat, "ItemWalkFlat", flat, kSigWalkFlat, kWalkPatchLen, -1, (void*)&HkWalkFlat);
-    else Log("engine: flat walk signature matched %d times - not hooked", hits);
-    if (ok) {
+    const uintptr_t fn = base + kSortSkip;
+    short expect[kSortPatchLen];
+    for (size_t i = 0; i < kSortPatchLen; ++i) expect[i] = kSigSortChunk[kSortSkip + i];
+    if (Wfx::Install(g_DetSortChunk, "ChunkSort", fn, expect, kSortPatchLen, -1, (void*)&HkSortChunk)) {
         g_IterOn.store(true, std::memory_order_relaxed);
-        Log("engine: item walk %p hooked - the viewmodel is put in order up front", (void*)chunks);
+        Log("engine: chunk sort %p hooked - the viewmodel is put in order after it", (void*)fn);
     }
 }
+
 } // namespace
 
 bool Install() {
@@ -871,8 +822,7 @@ bool Install() {
 
 void Remove() {
     g_IterOn.store(false, std::memory_order_relaxed);
-    Wfx::Remove(g_DetWalkFlat);
-    Wfx::Remove(g_DetWalkChunks);
+    Wfx::Remove(g_DetSortChunk);
     Wfx::Remove(g_Det);
     for (int i = 0; i < 500 && g_InHook.load(std::memory_order_acquire) > 0; ++i) Sleep(1);
 }
