@@ -1780,6 +1780,15 @@ bool EnsureCopies(ID3D11DeviceContext* c) {
 // not hold up before: "most weapon draws" counting the EQUAL passes too, and
 // "last run with weapon draws" (a knife on the ground is marked as well).
 void RollFrame(uint32_t frame) {
+    // The weapon's mesh sets are collected from its marked draws only. With the
+    // weapon effect off nothing refills them, and the set that was learnt before
+    // stayed for good: the weapon's own draws were then taken for the effect's
+    // passes (no depth of its own, parts of the gun gone, its insides showing)
+    // for as long as any other target had a shader. Forget them while it is off.
+    if (!g_Prog[kWeapon].ps.load(std::memory_order_relaxed)) {
+        g_VmVbCount[0] = g_VmVbCount[1] = 0;
+        g_HandVbCount[0] = g_HandVbCount[1] = 0;
+    }
     if (g_FramePrepassDrops) ++g_PrepassFrames;
     g_FramePrepassDrops = 0;
     int best = -1, lastWeapon = -1;

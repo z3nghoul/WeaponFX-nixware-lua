@@ -556,6 +556,12 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
         for (int n : cl.count) any += n;
         if (!any) return false;
     }
+    if (lflags & kLflagDepth) {
+        if (!on) return false;
+        int8_t strip[kMaxItems];
+        for (int i = 0; i < count; ++i) strip[i] = (int8_t)(cl.target[i] >= 0 && (on >> cl.target[i] & 1u));
+        return StripMarked(orig, p1, p2, items, count, p5, L, p7, strip, result);
+    }
     for (int t = 0; t < kTargets; ++t)
         if (first[t] >= 0) NoteModel(t, base + (size_t)first[t] * g_Stride);
     NoteItemModels(base, count, cl.target);
@@ -705,8 +711,16 @@ void ReorderItems(void* L, const uintptr_t* at, unsigned count) {
         !ReadMem((uintptr_t)L + kPassLflags, &lflags, 4) || (lflags & kLflagDepth))
         return;
     bool any = false;
+    // A target whose shader reads the scene (glass, black hole) is drawn after the
+    // ones that do not, so what lies behind it - the weapon's handle in the
+    // gloves' case - is already in the scene copy it samples. Among themselves
+    // they keep the inside-out order.
+    int bias[kTargets] = {};
     for (int t = 0; t < kTargets; ++t)
-        if ((Mode)g_Mode[t].load(std::memory_order_relaxed) != Mode::Off && Material::MarkerIfReady(t)) any = true;
+        if ((Mode)g_Mode[t].load(std::memory_order_relaxed) != Mode::Off && Material::MarkerIfReady(t)) {
+            any = true;
+            if (WeaponFx::ReadsScene(t)) bias[t] = 10;
+        }
     if (!any) return;
     static const int kRank[kTargets] = { 3, 1, 0, 2 };   // by Target: weapon, gloves, hands, sleeves
     unsigned idx[kMaxReorder];
@@ -714,7 +728,7 @@ void ReorderItems(void* L, const uintptr_t* at, unsigned count) {
     unsigned n = 0;
     for (unsigned i = 0; i < count; ++i) {
         const int t = ItemTarget(at[i], true);
-        if (t >= 0 && t < kTargets) { idx[n] = i; rank[n] = kRank[t]; ++n; }
+        if (t >= 0 && t < kTargets) { idx[n] = i; rank[n] = kRank[t] + bias[t]; ++n; }
     }
     if (n < 2) return;
     bool sorted = true;
