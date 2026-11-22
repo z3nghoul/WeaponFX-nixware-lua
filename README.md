@@ -1,9 +1,7 @@
 # WeaponFX for Nixware
 
 Custom HLSL pixel shaders on your own weapon and gloves in CS2, loaded as a
-[Nixware](https://nixware.cc) Lua script. Everything is drawn **only on your
-screen**: other players and demos see the normal skin. Meant for private
-servers and scripter modes where everyone agreed to play with scripts.
+[Nixware](https://nixware.cc) Lua script.
 
 Shaders included: `blackhole`, `chrome`, `cybergrid`, `galaxy`, `hologram`,
 `lava`, `lightning`, `liquid_glass`, `liquid_gold`, `plasma`, `prism_crystal`.
