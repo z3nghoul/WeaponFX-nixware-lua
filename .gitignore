@@ -1,0 +1,12 @@
+build/
+*.pdb
+*.obj
+*.dll
+*.exe
+*.lib
+*.exp
+*.ilk
+.vs/
+*.user
+dist/
+*.zip

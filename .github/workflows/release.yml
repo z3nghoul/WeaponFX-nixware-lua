@@ -1,0 +1,97 @@
+name: Build & Release WeaponFX
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0) - leave empty for CI artifact only'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build Public WeaponFX.dll (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build WeaponFX.dll (Public, no ImGui)
+        shell: cmd
+        run: |
+          cd weaponfx
+          call build.bat public
+
+      - name: Package release folder (C:\nix\scripts layout)
+        shell: pwsh
+        run: |
+          $stage = "dist"
+          New-Item -ItemType Directory -Path "$stage/WeaponFX/shaders" -Force | Out-Null
+
+          Copy-Item "weaponfx_loader.lua" "$stage/weaponfx_loader.lua" -Force
+          Copy-Item "weaponfx/build/WeaponFX.dll" "$stage/WeaponFX/WeaponFX.dll" -Force
+
+          Get-ChildItem "weaponfx/shaders" -File | Where-Object {
+            $_.Name -notlike "_probe_*" -and
+            $_.Name -notin @("debug.hlsl", "sky.hlsl", "masked.hlsl", "maskedglass.hlsl", "seethrough.hlsl")
+          } | Copy-Item -Destination "$stage/WeaponFX/shaders/" -Force
+
+          Compress-Archive -Path "$stage/*" -DestinationPath "WeaponFX-Nixware.zip" -Force
+
+          $dllHash = (Get-FileHash "$stage/WeaponFX/WeaponFX.dll" -Algorithm SHA256).Hash
+          $zipHash = (Get-FileHash "WeaponFX-Nixware.zip" -Algorithm SHA256).Hash
+
+          Write-Host "=== SHA-256 Checksums ==="
+          Write-Host "WeaponFX.dll         : $dllHash"
+          Write-Host "WeaponFX-Nixware.zip : $zipHash"
+
+          "DLL_SHA256=$dllHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_SHA256=$zipHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Attest build provenance (GitHub cryptographic proof)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/WeaponFX/WeaponFX.dll
+            WeaponFX-Nixware.zip
+
+      - name: Upload CI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeaponFX-Nixware
+          path: |
+            WeaponFX-Nixware.zip
+            dist/WeaponFX/WeaponFX.dll
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+          name: WeaponFX ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+          files: |
+            WeaponFX-Nixware.zip
+            dist/WeaponFX/WeaponFX.dll
+          body: |
+            ### 📥 Установка (Installation)
+            1. Скачайте **`WeaponFX-Nixware.zip`** и распакуйте содержимое прямо в **`C:\nix\scripts\`**:
+               - `C:\nix\scripts\weaponfx_loader.lua`
+               - `C:\nix\scripts\WeaponFX\WeaponFX.dll`
+               - `C:\nix\scripts\WeaponFX\shaders\...`
+            2. Запустите CS2, откройте в меню Nixware **Scripts -> Library** и загрузите **`WeaponFX`**.
+            3. В левой панели меню появится вкладка **`</> WeaponFX`**.
+
+            ---
+            ### 🔒 Проверка подлинности сборки (Built automatically by GitHub Actions)
+            Эта DLL собрана автоматически на серверах GitHub напрямую из исходного кода коммита `${{ github.sha }}` и подписана через **GitHub Artifact Attestation**.
+            - **`WeaponFX.dll` SHA-256:** `${{ env.DLL_SHA256 }}`
+            - **`WeaponFX-Nixware.zip` SHA-256:** `${{ env.ZIP_SHA256 }}`
