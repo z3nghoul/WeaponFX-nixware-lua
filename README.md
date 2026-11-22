@@ -71,8 +71,7 @@ git push origin v1.0.0
 
 ## Disclaimer
 
-This is foreign code running inside the game process. Use it offline or on
-servers where scripts are allowed; not for public matchmaking. Provided as is,
+This is foreign code running inside the game process. Not for public matchmaking. Provided as is,
 no warranty.
 
 ## License
