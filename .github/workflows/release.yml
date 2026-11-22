@@ -19,7 +19,9 @@ permissions:
 jobs:
   build:
     name: Build Public WeaponFX.dll (MSVC x64)
-    runs-on: windows-latest
+    # Pinned: windows-latest ships a newer MSVC (14.52) whose DLL misbehaves in game;
+    # windows-2022 gives MSVC 14.4x, matching the local build that works.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
