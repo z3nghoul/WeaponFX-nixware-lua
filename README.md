@@ -32,8 +32,9 @@ or reworked. The original license and copyright notice are kept in
 
 2. Start CS2 offline (`-insecure`, a local or private server).
 3. In Nixware open **Scripts → Library** and load **WeaponFX**.
-4. A **`</> WeaponFX`** tab appears in the menu. Pick a mode and a shader
-   for the weapon, gloves, hands or sleeves.
+4. A **`</> WeaponFX`** tab appears in the menu. Use the tab selector to pick
+   Weapon, Gloves, Hands or Sleeves, then choose a shader for it. The Home tab
+   checks whether your `WeaponFX.dll` is the latest release.
 
 Settings are saved to `C:\nix\scripts\WeaponFX\weaponfx.ini`.
 

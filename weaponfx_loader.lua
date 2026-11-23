@@ -1,12 +1,16 @@
 -- @name        WeaponFX
--- @version     1.0
--- @description Local viewmodel shaders (Weapon, Gloves, Hands, Sleeves) driven from the Nixware menu.
+-- @author      z3n1337
+-- @version     2.0
+-- @description WeaponFX Loader: custom viewmodel chams
 
 -- WeaponFX (MIT, Garagoro/WeaponFX) draws custom HLSL shaders on the local
 -- viewmodel only. Place WeaponFX.dll and the shaders/ folder in:
 --   C:\nix\scripts\WeaponFX\
 -- Custom .hlsl shaders dropped into C:\nix\scripts\WeaponFX\shaders\ are
 -- picked up automatically on script load.
+--
+-- On start the script checks GitHub for a newer WeaponFX.dll (SHA-256 of the
+-- local file vs. the latest release) and shows a notice if they differ.
 
 local ffi = require('ffi')
 
@@ -28,34 +32,29 @@ uint32_t GetLastError(void);
 void*    FindFirstFileA(const char* pattern, WFX_FIND_DATAA* data);
 int      FindNextFileA(void* find, WFX_FIND_DATAA* data);
 int      FindClose(void* find);
-uint32_t GetEnvironmentVariableA(const char* name, char* buffer, uint32_t size);
 uint32_t GetFileAttributesA(const char* path);
-int      CopyFileA(const char* existing, const char* new_file, int fail_if_exists);
+]]
+
+ffi.cdef[[
+typedef void* HINTERNET;
+HINTERNET InternetOpenA(const char* agent, uint32_t access, const char* proxy, const char* bypass, uint32_t flags);
+HINTERNET InternetOpenUrlA(HINTERNET session, const char* url, const char* headers, uint32_t headers_len, uint32_t flags, uintptr_t context);
+int       InternetReadFile(HINTERNET file, void* buffer, uint32_t size, uint32_t* read);
+int       InternetSetOptionA(HINTERNET handle, uint32_t option, void* buffer, uint32_t size);
+int       InternetCloseHandle(HINTERNET handle);
+int32_t   BCryptHash(void* alg, const uint8_t* secret, uint32_t secret_len, const uint8_t* input, uint32_t input_len, uint8_t* output, uint32_t output_len);
+void*     ShellExecuteA(void* hwnd, const char* verb, const char* file, const char* params, const char* dir, int show);
 ]]
 
 local C = ffi.C
 local DLL_NAME = 'WeaponFX.dll'
 
-local function env(name)
-    local buf = ffi.new('char[1024]')
-    local n = C.GetEnvironmentVariableA(name, buf, 1024)
-    if n == 0 or n >= 1024 then return nil end
-    return ffi.string(buf, n)
-end
-
 local function file_exists(path)
     return path ~= nil and path ~= '' and C.GetFileAttributesA(path) ~= 0xFFFFFFFF
 end
 
-local function resolve_data_dir()
-    local from_env = env('WEAPONFX_DIR')
-    if file_exists(from_env) then return from_env end
-    local nix_dir = 'C:\\nix\\scripts\\WeaponFX'
-    if file_exists(nix_dir) then return nix_dir end
-    return (env('LOCALAPPDATA') or '') .. '\\WeaponFX'
-end
-
-local DATA_DIR = resolve_data_dir()
+-- Nixware keeps scripts in %SystemDrive%\nix\scripts (documented default: C:)
+local DATA_DIR = (os.getenv('SystemDrive') or 'C:') .. '\\nix\\scripts\\WeaponFX'
 local SHADER_DIR = DATA_DIR .. '\\shaders'
 local INI_PATH = DATA_DIR .. '\\weaponfx.ini'
 local DLL_PATH = DATA_DIR .. '\\' .. DLL_NAME
@@ -160,19 +159,137 @@ for i, s in ipairs(shaders) do
     shader_names[i] = title_case(s.file:gsub('%.hlsl$', ''):gsub('_', ' '))
 end
 
--- UI (2 columns: Left = Weapon & Hands, Right = Gloves & Sleeves) -----------
+-- Update check -------------------------------------------------------------
+-- Compares SHA-256 of the local WeaponFX.dll with the hash CI writes into the
+-- latest release notes. Any failure is silent. Nothing is downloaded.
+
+local RELEASES_API = 'https://api.github.com/repos/z3nghoul/WeaponFX-nixware-lua/releases/latest'
+local RELEASES_PAGE = 'https://github.com/z3nghoul/WeaponFX-nixware-lua/releases/latest'
+local FORUM_URL = 'https://nixware.cc/workshop/1376/rate' -- review page; the button is hidden while empty
+local dll_state = 'checking' -- checking | missing | unknown | outdated | current
+local ready = false -- set once the update check is done; settings stay hidden until then
+
+local function fetch_release_body()
+    local wininet = ffi.load('wininet')
+    local session = wininet.InternetOpenA('WeaponFX-loader', 0, nil, nil, 0)
+    if session == nil then return nil end
+
+    local timeout = ffi.new('uint32_t[1]', 3000)
+    for _, option in ipairs({ 2, 5, 6 }) do -- connect, send, receive
+        wininet.InternetSetOptionA(session, option, timeout, 4)
+    end
+
+    local headers = 'Accept: application/vnd.github+json\r\n'
+    -- RELOAD | NO_CACHE_WRITE | NO_UI
+    local file = wininet.InternetOpenUrlA(session, RELEASES_API, headers, #headers, 0x84000200, 0)
+    if file == nil then
+        wininet.InternetCloseHandle(session)
+        return nil
+    end
+
+    local parts, total = {}, 0
+    local buf = ffi.new('uint8_t[8192]')
+    local got = ffi.new('uint32_t[1]')
+    while total < 262144 do
+        if wininet.InternetReadFile(file, buf, 8192, got) == 0 or got[0] == 0 then break end
+        parts[#parts + 1] = ffi.string(buf, got[0])
+        total = total + got[0]
+    end
+    wininet.InternetCloseHandle(file)
+    wininet.InternetCloseHandle(session)
+    return table.concat(parts)
+end
+
+local function sha256_hex(data)
+    local bcrypt = ffi.load('bcrypt')
+    local out = ffi.new('uint8_t[32]')
+    -- 0x41 = BCRYPT_SHA256_ALG_HANDLE (pseudo handle, Windows 10+)
+    if bcrypt.BCryptHash(ffi.cast('void*', 0x41), nil, 0, data, #data, out, 32) ~= 0 then return nil end
+    local hex = {}
+    for i = 0, 31 do hex[#hex + 1] = ('%02X'):format(out[i]) end
+    return table.concat(hex)
+end
+
+local function check_for_update()
+    dll_state = 'unknown'
+    local dll = read_file(DLL_PATH)
+    if not dll then
+        dll_state = 'missing'
+        return
+    end
+    local local_hash = sha256_hex(dll)
+    local body = fetch_release_body()
+    if not local_hash or not body then return end
+    local remote_hash = body:match('WeaponFX%.dll[^%w]*SHA%-256[^%w]*(%x+)')
+    if not remote_hash or #remote_hash ~= 64 then return end
+    dll_state = remote_hash:upper() == local_hash and 'current' or 'outdated'
+end
+
+local function open_url(url)
+    ffi.load('shell32').ShellExecuteA(nil, 'open', url, nil, nil, 1)
+end
+
+-- UI: one tab, a tab selector (Home / Weapon / Gloves / Hands / Sleeves) -----
 
 local dirty = true
 local function mark_dirty() dirty = true end
 
 local tab = assert(ui.tab('weaponfx', 'WeaponFX'))
+local left = tab:section('main_sec', 'General', 'left')
+local right = tab:section('side_sec', 'Settings', 'right')
 
 local TARGET_SPECS = {
-    { prefix = 'weapon',  label = 'Weapon',  section = 'default', side = 'left',  default_on = true,  bottom_pad = true  },
-    { prefix = 'gloves',  label = 'Gloves',  section = 'gloves',  side = 'right', default_on = false, bottom_pad = true  },
-    { prefix = 'hands',   label = 'Hands',   section = 'hands',   side = 'left',  default_on = false, bottom_pad = false },
-    { prefix = 'sleeves', label = 'Sleeves', section = 'sleeves', side = 'right', default_on = false, bottom_pad = false },
+    { prefix = 'weapon',  label = 'Weapon',  section = 'default', default_on = true  },
+    { prefix = 'gloves',  label = 'Gloves',  section = 'gloves',  default_on = false },
+    { prefix = 'hands',   label = 'Hands',   section = 'hands',   default_on = false },
+    { prefix = 'sleeves', label = 'Sleeves', section = 'sleeves', default_on = false },
 }
+
+local tab_names = { 'Home' }
+for i, spec in ipairs(TARGET_SPECS) do tab_names[i + 1] = spec.label end
+local selector = left:list('tab_selector', 'Tab selector', tab_names, 0)
+selector:order(-1)
+selector:set(0) -- always start on Home, whatever the config or a reload restored
+
+-- Home: feedback + update status
+do
+    local function on_home() return selector:get() == 0 end
+
+    local feedback = left:header('feedback_card', 'Feedback')
+    feedback:visible_if(on_home)
+    feedback:label('Thanks for using WeaponFX!')
+    feedback:label('Please leave a review, it helps a lot.')
+    feedback:button('forum_open', 'Leave a review', function() open_url(FORUM_URL) end)
+        :visible_if(function() return FORUM_URL ~= '' end)
+
+    -- Card captions are fixed, so the outdated state gets a card of its own.
+    local function is_loading() return not ready end
+    local function is_missing() return ready and dll_state == 'missing' end
+    local function is_unknown() return ready and dll_state == 'unknown' end
+    local function is_outdated() return ready and dll_state == 'outdated' end
+    local function is_current() return ready and dll_state == 'current' end
+
+    local checking = right:header('update_card', 'DLL update')
+    checking:visible_if(function() return on_home() and (is_loading() or is_unknown()) end)
+    checking:label('Checking for updates...'):visible_if(is_loading)
+    checking:label('Update check unavailable.'):visible_if(is_unknown)
+
+    local missing = right:header('update_missing_card', 'DLL NOT FOUND!')
+    missing:visible_if(function() return on_home() and is_missing() end)
+    missing:label('WeaponFX.dll is missing.')
+    missing:label('Download the full package from releases.')
+    missing:label('Extract it into the scripts folder.')
+    missing:button('missing_open', 'Open releases page', function() open_url(RELEASES_PAGE) end)
+
+    local good = right:header('update_ok_card', 'You are good to go')
+    good:visible_if(function() return on_home() and is_current() end)
+    good:label('DLL is up to date.')
+
+    local alert = right:header('update_alert_card', 'UPDATE THE DLL!')
+    alert:visible_if(function() return on_home() and is_outdated() end)
+    alert:label('New release: better stability and bugfixes.')
+    alert:button('update_open', 'Open releases page', function() open_url(RELEASES_PAGE) end)
+end
 
 local function shader_controls(container, prefix, shader, is_visible)
     local controls = {}
@@ -209,9 +326,10 @@ local function shader_controls(container, prefix, shader, is_visible)
 end
 
 local targets = {}
-for _, spec in ipairs(TARGET_SPECS) do
+for index, spec in ipairs(TARGET_SPECS) do
     local prefix = spec.prefix
-    local sec = tab:section(prefix .. '_sec', spec.label, spec.side)
+    local sec = right:header(prefix .. '_card', spec.label)
+    sec:visible_if(function() return ready and selector:get() == index end)
 
     local en = sec:checkbox(prefix .. '_en', 'Enable ' .. spec.label, spec.default_on)
     en:on_change(mark_dirty)
@@ -241,11 +359,6 @@ for _, spec in ipairs(TARGET_SPECS) do
         return s ~= nil and s.info.tex0
     end)
     tex0:on_change(mark_dirty)
-
-    if spec.bottom_pad then
-        sec:separator()
-        sec:label(' ')
-    end
 
     targets[#targets + 1] = {
         section = spec.section,
@@ -317,6 +430,7 @@ end
 
 local load_failed = false
 local next_try = 0
+local frames = 0
 
 local function module_handle()
     local h = C.GetModuleHandleA(DLL_NAME)
@@ -334,7 +448,6 @@ local function load_dll()
         log(('LoadLibrary failed for "%s", error %d%s'):format(DLL_PATH, err, hint))
         return
     end
-    log('loaded ' .. DLL_PATH)
 end
 
 local function stop_dll()
@@ -353,6 +466,14 @@ events.render(function()
         if dirty then
             dirty = false
             write_ini()
+        end
+        if not ready then
+            -- Let a few frames draw the "Checking for updates..." text first: the check
+            -- blocks the render thread for up to a few seconds on a bad network.
+            frames = frames + 1
+            if frames < 3 then return end
+            pcall(check_for_update)
+            ready = true
         end
         local now = os.clock()
         if now < next_try then return end
