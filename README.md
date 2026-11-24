@@ -22,18 +22,19 @@ or reworked. The original license and copyright notice are kept in
 
 ## Install
 
-1. Download `WeaponFX-Nixware.zip` from
-   [Releases](../../releases/latest) and extract it into `C:\nix\scripts\`:
+1. Get the **WeaponFX** Lua script from the Nixware workshop.
+2. Download `WeaponFX-Nixware.zip` from [Releases](../../releases/latest) (the
+   DLL alone is not enough: the shaders are in the archive) and extract it into
+   `C:\nix\scripts\`:
 
    ```
-   C:\nix\scripts\weaponfx_loader.lua
    C:\nix\scripts\WeaponFX\WeaponFX.dll
    C:\nix\scripts\WeaponFX\shaders\*.hlsl
    ```
 
-2. Start CS2 offline (`-insecure`, a local or private server).
-3. In Nixware open **Scripts → Library** and load **WeaponFX**.
-4. A **`</> WeaponFX`** tab appears in the menu. Use the tab selector to pick
+3. Start CS2 offline (`-insecure`, a local or private server).
+4. In Nixware open **Scripts → Library** and load **WeaponFX**.
+5. A **`</> WeaponFX`** tab appears in the menu. Use the tab selector to pick
    Weapon, Gloves, Hands or Sleeves, then choose a shader for it. The Home tab
    checks whether your `WeaponFX.dll` is the latest release.
 

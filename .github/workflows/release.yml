@@ -33,13 +33,12 @@ jobs:
           cd weaponfx
           call build.bat public
 
-      - name: Package release folder (C:\nix\scripts layout)
+      - name: Package release folder (C:\nix\scripts\WeaponFX layout; the Lua loader comes from the Nixware workshop)
         shell: pwsh
         run: |
           $stage = "dist"
           New-Item -ItemType Directory -Path "$stage/WeaponFX/shaders" -Force | Out-Null
 
-          Copy-Item "weaponfx_loader.lua" "$stage/weaponfx_loader.lua" -Force
           Copy-Item "weaponfx/build/WeaponFX.dll" "$stage/WeaponFX/WeaponFX.dll" -Force
 
           Get-ChildItem "weaponfx/shaders" -File | Where-Object {
@@ -72,7 +71,6 @@ jobs:
           name: WeaponFX-Nixware
           path: |
             WeaponFX-Nixware.zip
-            dist/WeaponFX/WeaponFX.dll
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
@@ -82,15 +80,14 @@ jobs:
           name: WeaponFX ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
           files: |
             WeaponFX-Nixware.zip
-            dist/WeaponFX/WeaponFX.dll
           body: |
             ### Installation
-            1. Download **`WeaponFX-Nixware.zip`** and extract its contents directly into **`C:\nix\scripts\`**:
-               - `C:\nix\scripts\weaponfx_loader.lua`
+            1. Get the **WeaponFX** Lua script from the Nixware workshop.
+            2. Download **`WeaponFX-Nixware.zip`** (the DLL alone is not enough: the shaders are in the archive) and extract it into **`C:\nix\scripts\`**:
                - `C:\nix\scripts\WeaponFX\WeaponFX.dll`
                - `C:\nix\scripts\WeaponFX\shaders\...`
-            2. Start CS2, open **Scripts -> Library** in the Nixware menu and load **`WeaponFX`**.
-            3. A **`</> WeaponFX`** tab will appear in the left panel of the menu.
+            3. Start CS2 with **`-insecure`**, open **Scripts -> Library** in the Nixware menu and load **`WeaponFX`**.
+            4. A **`</> WeaponFX`** tab will appear in the left panel of the menu.
 
             ---
             ### Build authenticity (built automatically by GitHub Actions)
