@@ -269,6 +269,7 @@ const void* g_MainDsv = nullptr;   // depth target bound at the viewmodel run's 
 // passes); a copy of one of those replaced the scene and the see-through
 // weapon read black - "the shadow" (2026-10-15).
 const void* g_MainRt = nullptr;
+uint32_t g_AttachLastFrame = 0;   // the last frame an attachment was drawn (third person)
 // Frames in a row without a viewmodel start. The start is only taken on
 // g_MainRt, so a wrong one learnt once (another program's view drawing a
 // marked weapon - a 3D preview window of another tool) locked it out for good. Past
@@ -1930,7 +1931,14 @@ void RollFrame(uint32_t frame) {
     g_CandW = 0;
     g_MainDraws = 0;
     if (g_CopiedRun >= 0) g_FramesNoStart = 0;
-    else if (++g_FramesNoStart > kRelearnFrames && (g_MainRt || g_MainDsv)) {
+    else if (g_Frame.load(std::memory_order_relaxed) - g_AttachLastFrame < 120u && g_AttachLastFrame != 0) {
+        // Third person: there is no viewmodel, so "no viewmodel for N frames" is the normal state, and
+        // the attachments are drawn against the screen target. Nulling it once in ~30 frames left
+        // that frame without the event that draws the deferred attachments (they vanished for a
+        // frame). Taken over from the frame's candidate instead, never dropped.
+        if (g_CandRt && g_CandDsv) { g_MainRt = g_CandRt; g_MainDsv = g_CandDsv; }
+        g_FramesNoStart = 0;
+    } else if (++g_FramesNoStart > kRelearnFrames && (g_MainRt || g_MainDsv)) {
         g_MainRt = nullptr;
         g_MainDsv = nullptr;
         g_FramesNoStart = 0;
@@ -2545,6 +2553,7 @@ bool DrawAttachment(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx
                     const DrawIndexedArgs* diArgs) {
     *on = false;
     if (!g_DsPre || !g_DsFx || !g_Prog[target].ps.load(std::memory_order_acquire)) return false;
+    g_AttachLastFrame = g_Frame.load(std::memory_order_relaxed);
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
@@ -2561,7 +2570,13 @@ bool DrawAttachment(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx
     const bool wantsDepth = g_Prog[target].usesDepth.load(std::memory_order_acquire);
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
     const void* rtRes = ResourceOf(rtv[0]);
-    if (wantsScene && diArgs && g_MainRt && rtRes == g_MainRt && g_DefAttachN < kMaxDeferredAttach) {
+    // The screen target as last known: g_MainRt is cleared now and then (about once in 30 frames)
+    // and relearnt only later in the frame; with it null the attachments of that frame were
+    // drawn at once, before the body, and read a copy with black where the body stands.
+    static const void* s_lastMainRt = nullptr;
+    if (g_MainRt) s_lastMainRt = g_MainRt;
+    const void* mainRt = g_MainRt ? g_MainRt : s_lastMainRt;
+    if (wantsScene && diArgs && mainRt && rtRes == mainRt && g_DefAttachN < kMaxDeferredAttach) {
         if (g_DefAttachFrame != frame) ClearDeferredAttach();
         DeferredAttach& slot = g_DefAttach[g_DefAttachN++];
         CapturePipeline(c, slot);
