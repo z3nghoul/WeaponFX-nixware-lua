@@ -4,7 +4,8 @@ Custom HLSL pixel shaders on your own weapon and gloves in CS2, loaded as a
 [Nixware](https://nixware.cc) Lua script.
 
 Shaders included: `blackhole`, `chrome`, `cybergrid`, `galaxy`, `hologram`,
-`lava`, `lightning`, `liquid_glass`, `liquid_gold`, `plasma`, `prism_crystal`.
+`holo_foil`, `its_raining`, `lava`, `lightning`, `liquid_glass`, `liquid_gold`,
+`plasma`, `prism_crystal`, `snow_is_falling`.
 Your own `.hlsl` files dropped into the `shaders` folder are picked up on
 script load.
 

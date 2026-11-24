@@ -3123,7 +3123,25 @@ bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uin
     // depth's stencil; taken for the viewmodel they were pointed at our depth,
     // whose stencil is not the main one, and drew nothing. They run as the
     // engine had it.
-    if (!weapon && !weaponPass && !(ds && dd.DepthEnable)) {
+    // Nor is a blended draw made outside a viewmodel RenderObjects call: the world's
+    // own passes that run between the viewmodel's start and its end (a projected
+    // shadow or decal - seen on de_cbble with the night mode on: a dark quad on the
+    // floor, visible through walls) were pointed at our cleared depth and lost the
+    // world's.
+    bool blended = false;
+    if (!weapon && !weaponPass && !g_InVmPass) {
+        ID3D11BlendState* bs0 = nullptr;
+        float bf0[4];
+        UINT sm0 = 0;
+        c->OMGetBlendState(&bs0, bf0, &sm0);
+        if (bs0) {
+            D3D11_BLEND_DESC bd0 = {};
+            bs0->GetDesc(&bd0);
+            bs0->Release();
+            blended = bd0.RenderTarget[0].BlendEnable != 0;
+        }
+    }
+    if (!weapon && !weaponPass && (!(ds && dd.DepthEnable) || blended)) {
         issue(ctx);
         for (ID3D11RenderTargetView* v : rtv)
             if (v) v->Release();
