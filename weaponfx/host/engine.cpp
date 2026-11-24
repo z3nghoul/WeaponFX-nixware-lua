@@ -319,9 +319,9 @@ bool GloveFolder(uintptr_t item, char* out, size_t cap) {
 
 void NoteModel(int target, uintptr_t item) {
     char path[260];
-    if (target == WeaponFx::kHands || target == WeaponFx::kSleeves) {
-        // No model of their own: one section ("hands", "sleeves"), seen once in hands.
-        strcpy_s(path, target == WeaponFx::kHands ? "hands" : "sleeves");
+    if (target == WeaponFx::kHands || target == WeaponFx::kSleeves || target == WeaponFx::kAttach) {
+        // No model of their own: one section ("hands", "sleeves", "attachments"), seen once.
+        strcpy_s(path, target == WeaponFx::kHands ? "hands" : target == WeaponFx::kSleeves ? "sleeves" : "attachments");
     } else if (!(target == kGloves ? GloveFolder(item, path, sizeof(path)) : ItemModel(item, path, sizeof(path)))) {
         return;
     }
@@ -409,7 +409,7 @@ thread_local QueuedTarget g_Queued[kTargets];
 thread_local int g_QueuedTotal = 0;
 
 void FlushQueued(RenderObjectsFn orig, void** result) {
-    constexpr int kOrder[kTargets] = { WeaponFx::kHands, kGloves, WeaponFx::kSleeves, kWeapon };
+    constexpr int kOrder[4] = { WeaponFx::kHands, kGloves, WeaponFx::kSleeves, kWeapon };
     void* lastRes = nullptr;
     for (int t : kOrder) {
         QueuedTarget& q = g_Queued[t];
@@ -650,6 +650,78 @@ bool HandleImpl(RenderObjectsFn orig, void* p1, void* p2, void* items, int count
     return MarkItems(orig, p1, p2, items, count, p5, L, p7, cl.target, marker, replace, overlay, result);
 }
 
+// --- the local player's attachments ------------------------------------------
+// The scene object of an entity's model holds the entity's handle (+0xC0, 2026-11-24
+// build, found by comparing scene objects with the entities the cheat's API lists);
+// its low 15 bits are the entity index. The script hands over the indices of what the
+// local pawn owns (the weapons and grenades on its body, the one in its hand); those
+// weapon-shader items, in a pass that is neither the viewmodel's nor a depth pass, are
+// drawn with the weapon's marker; in third person the draw hook reads such a draw as
+// the attachments' target. Everyone else's items have other indices and are untouched.
+constexpr size_t kSobjEntity = 0xC0;
+constexpr int kMaxAttach = 64;
+std::atomic<uint32_t> g_AttachIdx[kMaxAttach] = {};
+std::atomic<int> g_AttachN{0};
+std::atomic<unsigned> g_AttachItems{0};
+
+bool IsAttachIndex(uint32_t index) {
+    const int n = g_AttachN.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i)
+        if (g_AttachIdx[i].load(std::memory_order_relaxed) == index) return true;
+    return false;
+}
+
+bool HandleAttach(RenderObjectsFn orig, void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7,
+                  void** result) {
+    if (g_AttachN.load(std::memory_order_relaxed) <= 0) return false;
+    const Mode am = (Mode)g_Mode[WeaponFx::kAttach].load(std::memory_order_relaxed);
+    if (am == Mode::Off || !items || !L || count <= 0 || count > kMaxItems || g_Stride == 0 || g_Stride > 0x80) return false;
+    uint64_t view = 0;
+    uint32_t lflags = 0;
+    if (!ReadMem((uintptr_t)L + kPassViewBits, &view, 8) || !ReadMem((uintptr_t)L + kPassLflags, &lflags, 4)) return false;
+    if (view & kViewIsViewmodel) return false;
+    if (!WeaponFx::InAttachmentPass()) return false;   // first person: the local body is not drawn
+    if (!WeaponFx::Active(WeaponFx::kAttach)) return false;
+    const bool depthPass = (lflags & kLflagDepth) != 0;
+    if (depthPass && !(view & 1)) return false;   // another view's depth (a shadow map): as it is
+    int8_t targets[kMaxItems];
+    int found = 0;
+    const uintptr_t base = (uintptr_t)items;
+    uintptr_t firstItem = 0;
+    for (int i = 0; i < count; ++i) {
+        targets[i] = -1;
+        const uintptr_t item = base + (size_t)i * g_Stride;
+        void* mat = nullptr;
+        void* sobj = nullptr;
+        uint32_t handle = 0;
+        if (!ReadPtr(item + kItemMat, &mat) || ShaderClassOf(mat) != kWeaponShaderClass) continue;
+        if (!ReadPtr(item + kItemSobj, &sobj) || !sobj || !ReadMem((uintptr_t)sobj + kSobjEntity, &handle, 4)) continue;
+        if (!IsAttachIndex(handle & 0x7FFF)) continue;
+        targets[i] = (int8_t)WeaponFx::kAttach;
+        if (!found) firstItem = item;
+        ++found;
+    }
+    if (!found) return false;
+    NoteModel(WeaponFx::kAttach, firstItem);
+    void* marker[kTargets] = {};
+    marker[WeaponFx::kAttach] = Material::MarkerIfReady(WeaponFx::kAttach);
+    if (!marker[WeaponFx::kAttach]) return false;   // nothing to draw them with: they stay as the engine has them
+    if (depthPass) {
+        // The attachments leave the world's depth pass, as the viewmodel's weapon does: their
+        // own depth then comes from the marker's draws alone, so the colour pass finds it
+        // equal. With the engine's depth in place the marker (another vertex shader, a hair
+        // of difference) failed it in speckles.
+        int8_t strip[kMaxItems];
+        for (int i = 0; i < count; ++i) strip[i] = targets[i] >= 0 ? 1 : 0;
+        return StripMarked(orig, p1, p2, items, count, p5, L, p7, strip, result);
+    }
+    const bool asReplace = am == Mode::Replace;
+    const unsigned bit = 1u << WeaponFx::kAttach;
+    g_AttachItems.fetch_add((unsigned)found, std::memory_order_relaxed);
+    return MarkItems(orig, p1, p2, items, count, p5, L, p7, targets, marker, asReplace ? bit : 0, asReplace ? 0 : bit,
+                     result);
+}
+
 void* __fastcall HkRenderObjects(void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7) {
     struct Guard {
         Guard() {
@@ -665,6 +737,7 @@ void* __fastcall HkRenderObjects(void* p1, void* p2, void* items, int count, voi
     const RenderObjectsFn orig = (RenderObjectsFn)g_Det.orig;
     void* r = nullptr;
     if (HandleImpl(orig, p1, p2, items, count, p5, L, p7, &r)) return r;
+    if (HandleAttach(orig, p1, p2, items, count, p5, L, p7, &r)) return r;
     return orig(p1, p2, items, count, p5, L, p7);
 }
 
@@ -722,7 +795,7 @@ void ReorderItems(void* L, const uintptr_t* at, unsigned count) {
             if (WeaponFx::ReadsScene(t)) bias[t] = 10;
         }
     if (!any) return;
-    static const int kRank[kTargets] = { 3, 1, 0, 2 };   // by Target: weapon, gloves, hands, sleeves
+    static const int kRank[kTargets] = { 3, 1, 0, 2, 4 };   // by Target: weapon, gloves, hands, sleeves, attachments
     unsigned idx[kMaxReorder];
     int rank[kMaxReorder];
     unsigned n = 0;
@@ -852,7 +925,8 @@ bool Attach(size_t itemStride) {
 bool Handle(RenderObjectsFn orig, void* p1, void* p2, void* items, int count, void* p5, void* L, void* p7,
             void** result) {
     if (!g_Attached || !orig) return false;
-    return HandleImpl(orig, p1, p2, items, count, p5, L, p7, result);
+    if (HandleImpl(orig, p1, p2, items, count, p5, L, p7, result)) return true;
+    return HandleAttach(orig, p1, p2, items, count, p5, L, p7, result);
 }
 
 
@@ -860,6 +934,14 @@ bool Wanted() {
     for (int t = 0; t < kTargets; ++t)
         if (g_Mode[t].load(std::memory_order_relaxed) != (int)Mode::Off) return true;
     return false;
+}
+
+void SetAttachments(const unsigned* indices, int n) {
+    if (!indices || n < 0) n = 0;
+    if (n > kMaxAttach) n = kMaxAttach;
+    g_AttachN.store(0, std::memory_order_release);   // never read half a list
+    for (int i = 0; i < n; ++i) g_AttachIdx[i].store(indices[i] & 0x7FFF, std::memory_order_relaxed);
+    g_AttachN.store(n, std::memory_order_release);
 }
 
 void SetMode(int target, Mode m) {

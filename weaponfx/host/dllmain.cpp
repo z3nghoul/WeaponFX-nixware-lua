@@ -71,27 +71,39 @@ void OnFrame(IDXGISwapChain* sc, ID3D11Device* dev) {
     }
     Wfx::D3d::HookDraws(dev);
     if (g_EngineOn.load(std::memory_order_acquire)) {
+        bool anySeen = false;
         for (int t = 0; t < WeaponFx::kTargets; ++t) {
             char model[260];
             unsigned serial = 0;
             Wfx::Engine::Model(t, model, sizeof(model), &serial);
+            if (serial) anySeen = true;
             if (serial != g_ModelSerial[t]) {
                 g_ModelSerial[t] = serial;
-                static const char* const kName[] = { "weapon", "gloves", "hands", "sleeves" };
-                Wfx::Log("host: %s in hands %s", t >= 0 && t < 4 ? kName[t] : "?", model);
+                static const char* const kName[] = { "weapon", "gloves", "hands", "sleeves", "attachments" };
+                Wfx::Log("host: %s in hands %s", t >= 0 && t < 5 ? kName[t] : "?", model);
                 if (g_Wake) SetEvent(g_Wake);
             }
             // Created here, not on the scenesystem workers that use it: one
-            // thread owns the attempt. Not before the target was seen in
+            // thread owns the attempt. Not before a target was seen in
             // hands: in the main menu the marker's texture does not resolve and
             // the material came out with the engine's error texture (on the
             // weapon, and its views shared with every other missing texture).
-            if (serial && Wfx::Engine::GetMode(t) != Wfx::Engine::Mode::Off) Wfx::Material::Marker(t);
+            // For kAttach, pre-create as soon as any viewmodel target is seen
+            // in-game so switching to 3rd person applies immediately without the
+            // 500ms texture-load delay.
+            const bool readyToCreate = serial != 0 || (t == WeaponFx::kAttach && anySeen);
+            if (readyToCreate && Wfx::Engine::GetMode(t) != Wfx::Engine::Mode::Off) Wfx::Material::Marker(t);
             // Re-read every frame: the engine may swap the views when it streams.
             ID3D11ShaderResourceView* a = nullptr;
             ID3D11ShaderResourceView* b = nullptr;
             Wfx::Material::MarkerViews(t, &a, &b);
             Wfx::D3d::SetMarkerViews(t, a, b);
+            if (t == WeaponFx::kAttach) {
+                ID3D11ShaderResourceView* a2 = nullptr;
+                ID3D11ShaderResourceView* b2 = nullptr;
+                Wfx::Material::MarkerViews2(t, &a2, &b2);
+                Wfx::D3d::SetAttachMarkerViews2(a2, b2);
+            }
         }
     }
     if (g_FxReady.load(std::memory_order_relaxed)) WeaponFx::NewFrame();
@@ -200,8 +212,11 @@ extern "C" __declspec(dllexport) void WfxStop() {
     if (HANDLE wake = g_Wake) SetEvent(wake);
 }
 
+extern "C" __declspec(dllexport) void WfxSetThirdPerson(int on) { WeaponFx::SetThirdPerson(on != 0); }
+extern "C" __declspec(dllexport) void WfxSetAttachments(const unsigned* indices, int n) { Wfx::Engine::SetAttachments(indices, n); }
+
 #ifndef WFX_PUBLIC
-// Sky pass, for the host script (FFI): the shader file and the constants.
+// Sky pass, for the host script (FFI).
 extern "C" __declspec(dllexport) int WfxSkyLoad(const char* path) { return WeaponFx::SkyLoad(path) ? 1 : 0; }
 extern "C" __declspec(dllexport) void WfxSkySet(const float* data, int floats) { WeaponFx::SkySet(data, floats); }
 #endif

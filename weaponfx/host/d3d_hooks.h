@@ -35,6 +35,7 @@ void RemoveDraws();
 
 // A target's marker views (either may be null). Compared, never called through.
 void SetMarkerViews(int target, ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
+void SetAttachMarkerViews2(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b);
 void ClearMarkerViews();
 // Any draw hook in place.
 bool Hooked();

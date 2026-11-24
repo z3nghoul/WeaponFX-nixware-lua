@@ -66,6 +66,7 @@ struct Program {
     // full-screen blit, so effects that do not look through do not pay.
     std::atomic<bool> usesScene{false};
     std::atomic<bool> usesDepth{false};
+    std::atomic<bool> isBuiltin{false};
     // Mask textures, published for the render thread. Replaced ones are retired.
     std::atomic<ID3D11ShaderResourceView*> tex[kTextures] = {};
     std::atomic<float> param[kParams][4] = {};
@@ -79,7 +80,7 @@ struct Program {
     std::atomic<uint32_t> draws{0}, compiles{0}, failures{0};
 };
 Program g_Prog[kTargets];
-const char* const kTargetName[kTargets] = { "weapon", "gloves", "hands", "sleeves" };
+const char* const kTargetName[kTargets] = { "weapon", "gloves", "hands", "sleeves", "attachments" };
 
 bool ValidTarget(int t) { return t >= 0 && t < kTargets; }
 // The shared machinery runs while any target has a shader; a copy is made
@@ -102,6 +103,8 @@ bool AnyDepth() {
 // out = src + dst * (1 - src.a): premultiplied over, so a shader's alpha is how
 // much of what is under the weapon's pixel it covers.
 ID3D11BlendState* g_Blend = nullptr;
+// Multiplicative blend (out = src * dst) for built-in Default tint overlay.
+ID3D11BlendState* g_MulBlend = nullptr;
 
 // The scene behind the weapon and its depth, copied together. Render thread only.
 //
@@ -373,7 +376,7 @@ bool g_VmDepthReady = false;       // prepared for g_VmDepthFrame
 ID3D11DepthStencilState* g_DsPre = nullptr;   // depth-only pass: LESS_EQUAL, write, no stencil
 ID3D11DepthStencilState* g_DsFx = nullptr;    // our colour pass: LESS_EQUAL, no write, no stencil
 std::atomic<uint32_t> g_VmDepthDraws{0}, g_VmDepthPre{0}, g_VmDepthFails{0};
-std::atomic<unsigned> g_DebugBits{0};
+std::atomic<unsigned> g_DebugBits{0};   // dev build: 8 traces one frame of draws at load
 // What the viewmodel draws that got our depth-only pass were: depth test off,
 // or on with this comparison (index = D3D11_COMPARISON_FUNC, 1..8).
 std::atomic<uint32_t> g_PreNoTest{0}, g_PreFunc[9] = {};
@@ -530,26 +533,99 @@ private:
 // Under g_CompileLock.
 char g_Error[kTargets][1024] = {};
 
+// Embedded built-in chams shader ("builtin:nixware") - zero .hlsl files needed.
+// param0.xyz = RGB (0..1), param0.w = preset (0 Default, 1 Solid, 2 Flat,
+// 3 Bloom, 4 Latex, 5 Glow, 6 Metallic, 7 Wireframe, 8 Wireframe black base),
+// param1.x = alpha (0..1).
+constexpr char kBuiltinNixwareHlsl[] = R"HLSL(
+struct PSIn {
+    float3 pos : TEXCOORD0;
+    float3 nrm : TEXCOORD1;
+    float4 uv  : TEXCOORD2;
+    centroid float4 col : TEXCOORD4;
+    nointerpolation uint id : TEXCOORD12;
+    float4 svpos : SV_Position;
+    bool front : SV_IsFrontFace;
+};
+TextureCubeArray g_envCubes : register(t10);
+SamplerState     g_linear   : register(s0);
+cbuffer WeaponFx : register(b13) {
+    float4 g_fxTime;
+    float4 g_fxScreen;
+    float4 g_fxParam[4];
+    float4 g_fxFrameInfo;
+};
+float4 main(PSIn i) : SV_Target {
+    float3 col = g_fxParam[0].xyz;
+    int mode = (int)round(g_fxParam[0].w);
+    float a = saturate(g_fxParam[1].x);
+    if (mode == 8) return float4(0.0, 0.0, 0.0, 1.0);
+    if (mode == 7) return float4(col * a, a);
+    if (mode == 0) return float4(lerp(float3(1.0, 1.0, 1.0), col, a), 1.0);
+    if (mode == 2) return float4(col * a, a);
+    if (mode == 3) return float4(col * 11.0 * a, a);
+    float3 N = normalize(i.nrm);
+    float3 V = normalize(i.pos);
+    float3 L = normalize(float3(0.2, 0.3, 0.9));
+    float ndl = saturate(dot(N, L));
+    float fr = pow(1.0 - saturate(dot(N, -V)), 2.5);
+    if (mode == 1) return float4(col * (0.25 + 0.75 * ndl) * a, a);
+    if (mode == 4) {
+        float3 R = reflect(V, N);
+        float3 env = min(g_envCubes.SampleLevel(g_linear, float4(R, 0.0), 1.5).rgb, 2.2);
+        float sky = smoothstep(-0.08, 0.50, R.z);
+        float3 hemi = lerp(float3(0.04, 0.05, 0.06), float3(1.35, 1.45, 1.55), sky);
+        float3 ref = lerp(env * 1.8, hemi, 0.72);
+        float3 c = col * (0.28 + 0.68 * ndl) + ref * (0.14 + 0.82 * fr) * 0.78;
+        return float4(c * a, a);
+    }
+    if (mode == 5) {
+        float rim = pow(1.0 - saturate(dot(N, -V)), 2.6);
+        if (a >= 0.995) return float4(col * (0.01 + rim * 2.4), 1.0);
+        float outA = saturate(rim * a);
+        return float4(col * rim * 2.4 * a, outA);
+    }
+    if (mode == 6) {
+        float3 R = reflect(V, N);
+        float3 env = min(g_envCubes.SampleLevel(g_linear, float4(R, 0.0), 1.5).rgb, 2.5);
+        float sky = smoothstep(-0.15, 0.45, R.z);
+        float3 hemi = lerp(float3(0.06, 0.07, 0.08), float3(1.45, 1.50, 1.55), sky);
+        float3 ref = lerp(env * 2.4, hemi, 0.72);
+        float3 c = ref * lerp(col, float3(1.0, 1.0, 1.0), fr * 0.35);
+        return float4(c * a, a);
+    }
+    return float4(col * a, a);
+}
+)HLSL";
+
 // Caller holds g_CompileLock exclusively. A failed compile leaves the current
 // shader in place: a typo mid-edit must not blank the weapon.
 bool CompileLocked(int t) {
     Program& p = g_Prog[t];
+    const bool isBuiltin = strcmp(p.path, "builtin:nixware") == 0;
     char* src = nullptr;
     DWORD len = 0;
     FILETIME when = {};
-    if (!ReadSource(p.path, &src, &len, &when)) {
-        Logf("WeaponFX: %s - cannot read %s", kTargetName[t], p.path);
-        _snprintf_s(g_Error[t], sizeof(g_Error[t]), _TRUNCATE, "cannot read %s", p.path);
-        return false;
+    const char* compileSrc = nullptr;
+    if (isBuiltin) {
+        compileSrc = kBuiltinNixwareHlsl;
+        len = (DWORD)(sizeof(kBuiltinNixwareHlsl) - 1);
+    } else {
+        if (!ReadSource(p.path, &src, &len, &when)) {
+            Logf("WeaponFX: %s - cannot read %s", kTargetName[t], p.path);
+            _snprintf_s(g_Error[t], sizeof(g_Error[t]), _TRUNCATE, "cannot read %s", p.path);
+            return false;
+        }
+        p.pathTime = when;   // a broken save is not retried until the next save
+        compileSrc = src;
     }
-    p.pathTime = when;   // a broken save is not retried until the next save
 
     ID3DBlob* code = nullptr;
     ID3DBlob* err = nullptr;
     FolderInclude includes(p.path);
-    const HRESULT hr = g_Compile(src, len, p.path, nullptr, &includes, "main", "ps_5_0",
+    const HRESULT hr = g_Compile(compileSrc, len, p.path, nullptr, isBuiltin ? nullptr : &includes, "main", "ps_5_0",
                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
-    HeapFree(GetProcessHeap(), 0, src);
+    if (src) HeapFree(GetProcessHeap(), 0, src);
     if (FAILED(hr) || !code) {
         p.failures.fetch_add(1, std::memory_order_relaxed);
         const char* msg = err ? (const char*)err->GetBufferPointer() : "(no message)";
@@ -562,8 +638,8 @@ bool CompileLocked(int t) {
     if (err) err->Release();
     ID3D11PixelShader* ps = nullptr;
     const HRESULT hc = g_Dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps);
-    const bool usesScene = ShaderReads(code->GetBufferPointer(), code->GetBufferSize(), "g_fxScene");
-    const bool usesDepth = ShaderReads(code->GetBufferPointer(), code->GetBufferSize(), "g_fxDepth");
+    const bool usesScene = !isBuiltin && ShaderReads(code->GetBufferPointer(), code->GetBufferSize(), "g_fxScene");
+    const bool usesDepth = !isBuiltin && ShaderReads(code->GetBufferPointer(), code->GetBufferSize(), "g_fxDepth");
     code->Release();
     if (FAILED(hc) || !ps) {
         p.failures.fetch_add(1, std::memory_order_relaxed);
@@ -575,6 +651,7 @@ bool CompileLocked(int t) {
     // the old "no scene" and skip the copy it reads.
     p.usesScene.store(usesScene, std::memory_order_release);
     p.usesDepth.store(usesDepth, std::memory_order_release);
+    p.isBuiltin.store(isBuiltin, std::memory_order_release);
     Retire(p.ps.exchange(ps, std::memory_order_acq_rel));
     p.compiles.fetch_add(1, std::memory_order_relaxed);
     g_Error[t][0] = 0;
@@ -875,7 +952,7 @@ DWORD WINAPI WatchThread(void*) {
         MemGuardLocked();
         for (int t = 0; t < kTargets; ++t) {
             Program& p = g_Prog[t];
-            if (!p.path[0]) continue;
+            if (!p.path[0] || strncmp(p.path, "builtin:", 8) == 0) continue;
             WIN32_FILE_ATTRIBUTE_DATA a = {};
             wchar_t w[MAX_PATH];
             if (WidePath(p.path, w, MAX_PATH) && GetFileAttributesExW(w, GetFileExInfoStandard, &a) &&
@@ -1779,7 +1856,10 @@ bool EnsureCopies(ID3D11DeviceContext* c) {
 // one-draw run after the knife, and the knife read no scene: black). What did
 // not hold up before: "most weapon draws" counting the EQUAL passes too, and
 // "last run with weapon draws" (a knife on the ground is marked as well).
+void ClearDeferredAttach();
+
 void RollFrame(uint32_t frame) {
+    ClearDeferredAttach();
     // The weapon's mesh sets are collected from its marked draws only. With the
     // weapon effect off nothing refills them, and the set that was learnt before
     // stayed for good: the weapon's own draws were then taken for the effect's
@@ -2248,6 +2328,321 @@ bool DrawMissedWeapon(ID3D11DeviceContext* c, int target, IssueFn issue, void* c
     return true;
 }
 
+// One of the local player's attachments (third person), drawn with its marker. Its depth
+// goes into the MAIN depth - a depth-only pass tested against the world (behind a wall it
+// fails, in front it writes), then our colour pass at the same depth - because the engine's
+// own pass of it, which would have left it there, was taken out of the depth pass (the
+// marker's vertex shader is not the engine's, and its depth did not match that one's). What
+// the game draws later and tests against the depth - water, glass, smoke - then stays behind
+// it instead of painting over it. Nothing to do without a colour target (a shadow map).
+// A rasterizer state like the engine's with a depth bias toward the camera: an attachment
+// sits flush against the body (a weapon on a backpack, a grenade on a belt) and parts of it
+// lie a hair behind the body's surface; the engine draws them with its own bias, the marker
+// has none, and the depth test against the body cut those parts out. Cached per source state.
+CopySlot g_AttachSceneSlots[kCopySlots];
+CopySlot g_AttachDepthSlots[kCopySlots];
+ID3D11ShaderResourceView* g_AttachSceneSrv = nullptr;
+ID3D11ShaderResourceView* g_AttachDepthSrv = nullptr;
+uint32_t g_AttachCopyFrame = ~0u;
+const void* g_AttachCopyRt = nullptr;
+
+// Deferred replay for scene-reading attachment shaders (liquid_glass, prism_crystal, etc.).
+constexpr int kMaxDeferredAttach = 32;
+constexpr int kDefVbs = 4;
+constexpr int kDefCbs = 14;
+constexpr int kDefSrvs = 16;
+
+struct DeferredAttach {
+    DrawIndexedArgs args = {};
+    ID3D11InputLayout* il = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    ID3D11Buffer* ib = nullptr;
+    DXGI_FORMAT ibFmt = DXGI_FORMAT_UNKNOWN;
+    UINT ibOff = 0;
+    ID3D11Buffer* vb[kDefVbs] = {};
+    UINT vbStride[kDefVbs] = {}, vbOff[kDefVbs] = {};
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11Buffer* vsCb[kDefCbs] = {};
+    UINT vsCbFirst[kDefCbs] = {}, vsCbNum[kDefCbs] = {};
+    bool vsCbSliced = false;
+    ID3D11ShaderResourceView* vsSrv[kDefSrvs] = {};
+    ID3D11Buffer* psCb[kDefCbs] = {};
+    UINT psCbFirst[kDefCbs] = {}, psCbNum[kDefCbs] = {};
+    bool psCbSliced = false;
+    ID3D11RasterizerState* rs = nullptr;
+    D3D11_VIEWPORT vp = {};
+    UINT nvp = 0;
+    D3D11_RECT sc = {};
+    UINT nsc = 0;
+};
+
+DeferredAttach g_DefAttach[kMaxDeferredAttach];
+int g_DefAttachN = 0;
+ID3D11RenderTargetView* g_DefAttachRtv = nullptr;
+uint32_t g_DefAttachFrame = ~0u;
+
+void ReleaseDeferredItem(DeferredAttach& d) {
+    if (d.il) { d.il->Release(); d.il = nullptr; }
+    if (d.ib) { d.ib->Release(); d.ib = nullptr; }
+    for (int i = 0; i < kDefVbs; ++i)
+        if (d.vb[i]) { d.vb[i]->Release(); d.vb[i] = nullptr; }
+    if (d.vs) { d.vs->Release(); d.vs = nullptr; }
+    for (int i = 0; i < kDefCbs; ++i) {
+        if (d.vsCb[i]) { d.vsCb[i]->Release(); d.vsCb[i] = nullptr; }
+        if (d.psCb[i]) { d.psCb[i]->Release(); d.psCb[i] = nullptr; }
+    }
+    for (int i = 0; i < kDefSrvs; ++i)
+        if (d.vsSrv[i]) { d.vsSrv[i]->Release(); d.vsSrv[i] = nullptr; }
+    if (d.rs) { d.rs->Release(); d.rs = nullptr; }
+    d = {};
+}
+
+void ClearDeferredAttach() {
+    for (int i = 0; i < g_DefAttachN; ++i) ReleaseDeferredItem(g_DefAttach[i]);
+    g_DefAttachN = 0;
+    if (g_DefAttachRtv) { g_DefAttachRtv->Release(); g_DefAttachRtv = nullptr; }
+    g_DefAttachFrame = ~0u;
+}
+
+void CapturePipeline(ID3D11DeviceContext* c, DeferredAttach& d) {
+    d = {};
+    c->IAGetInputLayout(&d.il);
+    c->IAGetPrimitiveTopology(&d.topo);
+    c->IAGetIndexBuffer(&d.ib, &d.ibFmt, &d.ibOff);
+    c->IAGetVertexBuffers(0, kDefVbs, d.vb, d.vbStride, d.vbOff);
+    c->VSGetShader(&d.vs, nullptr, nullptr);
+    c->VSGetShaderResources(0, kDefSrvs, d.vsSrv);
+    ID3D11DeviceContext1* c1 = nullptr;
+    if (SUCCEEDED(c->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1)) && c1) {
+        c1->VSGetConstantBuffers1(0, kDefCbs, d.vsCb, d.vsCbFirst, d.vsCbNum);
+        c1->PSGetConstantBuffers1(0, kDefCbs, d.psCb, d.psCbFirst, d.psCbNum);
+        c1->Release();
+        d.vsCbSliced = true;
+        d.psCbSliced = true;
+    } else {
+        c->VSGetConstantBuffers(0, kDefCbs, d.vsCb);
+        c->PSGetConstantBuffers(0, kDefCbs, d.psCb);
+    }
+    c->RSGetState(&d.rs);
+    d.nvp = 1;
+    c->RSGetViewports(&d.nvp, &d.vp);
+    d.nsc = 1;
+    c->RSGetScissorRects(&d.nsc, &d.sc);
+}
+
+void ApplyPipeline(ID3D11DeviceContext* c, const DeferredAttach& d) {
+    c->IASetInputLayout(d.il);
+    c->IASetPrimitiveTopology(d.topo);
+    c->IASetIndexBuffer(d.ib, d.ibFmt, d.ibOff);
+    c->IASetVertexBuffers(0, kDefVbs, d.vb, d.vbStride, d.vbOff);
+    c->VSSetShader(d.vs, nullptr, 0);
+    c->VSSetShaderResources(0, kDefSrvs, d.vsSrv);
+    ID3D11DeviceContext1* c1 = nullptr;
+    if ((d.vsCbSliced || d.psCbSliced) &&
+        SUCCEEDED(c->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1)) && c1) {
+        if (d.vsCbSliced) c1->VSSetConstantBuffers1(0, kDefCbs, d.vsCb, d.vsCbFirst, d.vsCbNum);
+        else              c->VSSetConstantBuffers(0, kDefCbs, d.vsCb);
+        if (d.psCbSliced) c1->PSSetConstantBuffers1(0, kDefCbs, d.psCb, d.psCbFirst, d.psCbNum);
+        else              c->PSSetConstantBuffers(0, kDefCbs, d.psCb);
+        c1->Release();
+    } else {
+        c->VSSetConstantBuffers(0, kDefCbs, d.vsCb);
+        c->PSSetConstantBuffers(0, kDefCbs, d.psCb);
+    }
+    c->RSSetState(d.rs);
+    if (d.nvp) c->RSSetViewports(d.nvp, &d.vp);
+    if (d.nsc) c->RSSetScissorRects(d.nsc, &d.sc);
+}
+
+void FlushDeferredAttach(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, uint32_t frame) {
+    if (g_DefAttachN <= 0 || !g_DefAttachRtv || !dsv || !g_DsPre || !g_DsFx ||
+        !g_Prog[kAttach].ps.load(std::memory_order_acquire)) {
+        ClearDeferredAttach();
+        return;
+    }
+    DeferredAttach savedPipe;
+    CapturePipeline(c, savedPipe);
+    ID3D11RenderTargetView* savedRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* savedDsv = nullptr;
+    c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtv, &savedDsv);
+    ID3D11DepthStencilState* savedDs = nullptr;
+    UINT savedRef = 0;
+    c->OMGetDepthStencilState(&savedDs, &savedRef);
+    ID3D11PixelShader* savedPs = nullptr;
+    c->PSGetShader(&savedPs, nullptr, nullptr);
+
+    g_SkyInside = true;
+    const bool wantsScene = g_Prog[kAttach].usesScene.load(std::memory_order_acquire);
+    const bool wantsDepth = g_Prog[kAttach].usesDepth.load(std::memory_order_acquire);
+    g_AttachCopyFrame = frame;
+    g_AttachCopyRt = ResourceOf(g_DefAttachRtv);
+    g_AttachSceneSrv = nullptr;
+    g_AttachDepthSrv = nullptr;
+    c->OMSetRenderTargets(1, &g_DefAttachRtv, dsv);
+    if (wantsScene) {
+        ID3D11Texture2D* sTex = g_SceneTex;
+        ID3D11ShaderResourceView* sSrv = g_SceneSrv;
+        if (CopyScene(c, g_AttachSceneSlots)) g_AttachSceneSrv = g_SceneSrv;
+        g_SceneTex = sTex;
+        g_SceneSrv = sSrv;
+    }
+    if (wantsDepth) {
+        ID3D11Texture2D* sTex = g_DepthTex;
+        ID3D11ShaderResourceView* sSrv = g_DepthSrv;
+        if (CopyDepthFrom(dsv, c, g_AttachDepthSlots)) g_AttachDepthSrv = g_DepthSrv;
+        g_DepthTex = sTex;
+        g_DepthSrv = sSrv;
+    }
+    for (int i = 0; i < g_DefAttachN; ++i) {
+        const DeferredAttach& d = g_DefAttach[i];
+        ApplyPipeline(c, d);
+        c->OMSetRenderTargets(0, nullptr, dsv);
+        c->OMSetDepthStencilState(g_DsPre, 0);
+        c->PSSetShader(nullptr, nullptr, 0);
+        c->DrawIndexedInstanced(d.args.indexCount, d.args.instanceCount, d.args.startIndex, d.args.baseVertex,
+                                d.args.startInstance);
+        c->OMSetRenderTargets(1, &g_DefAttachRtv, dsv);
+        Bound fx;
+        const bool on = Begin(c, kAttach, fx);
+        if (on) {
+            c->OMSetDepthStencilState(g_DsFx, 0);
+            c->DrawIndexedInstanced(d.args.indexCount, d.args.instanceCount, d.args.startIndex, d.args.baseVertex,
+                                    d.args.startInstance);
+        }
+        End(c, fx);
+    }
+    g_SkyInside = false;
+
+    ApplyPipeline(c, savedPipe);
+    ReleaseDeferredItem(savedPipe);
+    c->PSSetShader(savedPs, nullptr, 0);
+    if (savedPs) savedPs->Release();
+    c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRtv, savedDsv);
+    c->OMSetDepthStencilState(savedDs, savedRef);
+    for (ID3D11RenderTargetView* v : savedRtv)
+        if (v) v->Release();
+    if (savedDsv) savedDsv->Release();
+    if (savedDs) savedDs->Release();
+    ClearDeferredAttach();
+}
+
+ID3D11RasterizerState* g_WireRs = nullptr;
+
+ID3D11RasterizerState* WireframeState() {
+    if (g_WireRs) return g_WireRs;
+    if (!g_Dev) return nullptr;
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_WIREFRAME;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.DepthBias = -50;
+    rd.SlopeScaledDepthBias = -1.0f;
+    if (FAILED(g_Dev->CreateRasterizerState(&rd, &g_WireRs))) g_WireRs = nullptr;
+    return g_WireRs;
+}
+
+bool DrawAttachment(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, bool* on,
+                    const DrawIndexedArgs* diArgs) {
+    *on = false;
+    if (!g_DsPre || !g_DsFx || !g_Prog[target].ps.load(std::memory_order_acquire)) return false;
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+    auto release = [&]() {
+        for (ID3D11RenderTargetView* v : rtv)
+            if (v) v->Release();
+        if (dsv) dsv->Release();
+    };
+    if (!rtv[0] || !dsv) {
+        release();
+        return false;
+    }
+    const bool wantsScene = g_Prog[target].usesScene.load(std::memory_order_acquire);
+    const bool wantsDepth = g_Prog[target].usesDepth.load(std::memory_order_acquire);
+    const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+    const void* rtRes = ResourceOf(rtv[0]);
+    if (wantsScene && diArgs && g_MainRt && rtRes == g_MainRt && g_DefAttachN < kMaxDeferredAttach) {
+        if (g_DefAttachFrame != frame) ClearDeferredAttach();
+        DeferredAttach& slot = g_DefAttach[g_DefAttachN++];
+        CapturePipeline(c, slot);
+        slot.args = *diArgs;
+        if (!g_DefAttachRtv) { g_DefAttachRtv = rtv[0]; g_DefAttachRtv->AddRef(); }
+        g_DefAttachFrame = frame;
+        release();
+        *on = true;
+        return true;
+    }
+    if (wantsScene || wantsDepth) {
+        if (g_AttachCopyFrame != frame || g_AttachCopyRt != rtRes) {
+            g_AttachCopyFrame = frame;
+            g_AttachCopyRt = rtRes;
+            g_AttachSceneSrv = nullptr;
+            g_AttachDepthSrv = nullptr;
+            if (wantsScene) {
+                ID3D11Texture2D* savedTex = g_SceneTex;
+                ID3D11ShaderResourceView* savedSrv = g_SceneSrv;
+                if (CopyScene(c, g_AttachSceneSlots)) g_AttachSceneSrv = g_SceneSrv;
+                g_SceneTex = savedTex;
+                g_SceneSrv = savedSrv;
+            }
+            if (wantsDepth) {
+                ID3D11Texture2D* savedTex = g_DepthTex;
+                ID3D11ShaderResourceView* savedSrv = g_DepthSrv;
+                if (CopyDepthFrom(dsv, c, g_AttachDepthSlots)) g_AttachDepthSrv = g_DepthSrv;
+                g_DepthTex = savedTex;
+                g_DepthSrv = savedSrv;
+            }
+        }
+    }
+    ID3D11DepthStencilState* ds = nullptr;
+    UINT ref = 0;
+    c->OMGetDepthStencilState(&ds, &ref);
+    const bool isWire = g_Prog[target].isBuiltin.load(std::memory_order_relaxed) &&
+                        g_Prog[target].param[0][3].load(std::memory_order_relaxed) >= 6.5f;
+    const float wireAlpha = isWire ? g_Prog[target].param[1][0].load(std::memory_order_relaxed) : 1.0f;
+    if (isWire) {
+        ID3D11RasterizerState* savedRs = nullptr;
+        c->RSGetState(&savedRs);
+        if (wireAlpha >= 0.995f) {
+            c->OMSetRenderTargets(0, nullptr, dsv);
+            c->OMSetDepthStencilState(g_DsPre, 0);
+            IssueDepthOnly(c, issue, ctx);
+            c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+            g_Prog[target].param[0][3].store(8.0f, std::memory_order_relaxed);
+            Bound fxBase;
+            const bool baseOn = Begin(c, target, fxBase);
+            c->OMSetDepthStencilState(g_DsFx, 0);
+            if (baseOn) issue(ctx);
+            End(c, fxBase);
+            g_Prog[target].param[0][3].store(7.0f, std::memory_order_relaxed);
+        }
+        if (ID3D11RasterizerState* wrs = WireframeState()) c->RSSetState(wrs);
+        c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+        Bound fx;
+        *on = Begin(c, target, fx);
+        c->OMSetDepthStencilState(g_DsFx, 0);
+        issue(ctx);
+        End(c, fx);
+        c->RSSetState(savedRs);
+        if (savedRs) savedRs->Release();
+    } else {
+        c->OMSetRenderTargets(0, nullptr, dsv);
+        c->OMSetDepthStencilState(g_DsPre, 0);
+        IssueDepthOnly(c, issue, ctx);
+        c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+        Bound fx;
+        *on = Begin(c, target, fx);
+        c->OMSetDepthStencilState(g_DsFx, 0);
+        issue(ctx);
+        End(c, fx);
+    }
+    c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+    c->OMSetDepthStencilState(ds, ref);
+    if (ds) ds->Release();
+    release();
+    return true;
+}
+
 // Depth watch: frames where a weapon draw with our effect went out with no
 // depth test of ours, by reason - the frames the weapon can turn inside out.
 // Only draws on a screen-wide target count (a weapon in a reflection or a
@@ -2376,6 +2771,14 @@ void Shutdown() {
     ReleaseSlots(g_DepthSlots);
     ReleaseSlots(g_DbgDepthSlots);
     ReleaseSlots(g_DbgSceneSlots);
+    ReleaseSlots(g_AttachSceneSlots);
+    ReleaseSlots(g_AttachDepthSlots);
+    ClearDeferredAttach();
+    if (g_WireRs) { g_WireRs->Release(); g_WireRs = nullptr; }
+    g_AttachSceneSrv = nullptr;
+    g_AttachDepthSrv = nullptr;
+    g_AttachCopyFrame = ~0u;
+    g_AttachCopyRt = nullptr;
     Hold(g_DbgSceneSrv, nullptr);
     ReleaseOtherDepth();
     ReleaseVmDepth();
@@ -2403,6 +2806,7 @@ void Shutdown() {
     SkyRelease();
     if (g_Cb) { g_Cb->Release(); g_Cb = nullptr; }
     if (g_Blend) { g_Blend->Release(); g_Blend = nullptr; }
+    if (g_MulBlend) { g_MulBlend->Release(); g_MulBlend = nullptr; }
     g_Dev->Release();
     g_Dev = nullptr;
 }
@@ -2559,6 +2963,27 @@ bool BeforeDraw(ID3D11DeviceContext* c, int target, uint64_t key) {
     if (g_SkyInside) return false;   // our own sky draw
     if (!AnyActive()) return false;
     if (!AnyScene() && !AnyDepth() && !g_VmDepthOn.load(std::memory_order_relaxed)) return false;
+    if (target == kAttach) {
+        if (HasColorTarget(c)) {
+            g_TrackCtx = c;
+            if (!g_MainRt || !g_MainDsv) {
+                const uint32_t w = RtWidth(c);
+                if (w > g_CandW) {
+                    g_CandW = w;
+                    g_CandRt = BoundRtResource(c);
+                    g_CandDsv = BoundDsvResource(c);
+                }
+            }
+        }
+        if (c == g_TrackCtx) {
+            const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+            if (g_TrackFrame != frame) RollFrame(frame);
+            if (g_DbgDepthAt.load(std::memory_order_relaxed) == g_DbgDrawIdx++) DbgCopyAt(c, nullptr);
+            if (g_MainRt && BoundRtResource(c) == g_MainRt && g_CopiedRun < 0) ++g_MainDraws;
+            if (g_MainDsv && BoundDsvResource(c) == g_MainDsv) ++g_WritesSinceClear;
+        }
+        return false;
+    }
     // Everything below is the shared pipeline: the gloves' draws are marked
     // draws of the viewmodel run like the weapon's.
     bool weapon = ValidTarget(target);
@@ -2775,6 +3200,8 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
                     g_MainStencilKnown = true;
                     g_MainStencilValue = stencil;
                 }
+                if (g_DefAttachN > 0 && g_DefAttachFrame == frame && g_WritesSinceClear >= 20)
+                    FlushDeferredAttach(c, dsv, frame);
                 EarlyVmClear(c, dsv, r, frame, stencil);
             }
         }
@@ -2937,39 +3364,49 @@ bool Begin(ID3D11DeviceContext* c, int target, Bound& saved) {
     ID3D11ShaderResourceView* views[kViews] = {};
     const bool scene = prog.usesScene.load(std::memory_order_acquire);
     const bool depth = prog.usesDepth.load(std::memory_order_acquire);
-    const bool copies = (scene || depth) && EnsureCopies(c);
-    if (scene && !copies) {   // TEMPORARY diagnostics (2026-11-20): a scene reader with no copy
-        static ULONGLONG s_next = 0;
-        const ULONGLONG nowT = GetTickCount64();
-        if (nowT >= s_next) {
-            s_next = nowT + 500;
-            Logf("WeaponFX: NO SCENE COPY for target %d - run %d predicted %d copiedRun %d inVmRun %d mainRt %d frame %u sceneDone %u vmSceneFrame %u",
-                 target, g_Run, g_PredictedRun, g_CopiedRun, (int)InVmRun(g_Frame.load(std::memory_order_relaxed)),
-                 (int)(g_MainRt && BoundRtResource(c) == g_MainRt), g_Frame.load(std::memory_order_relaxed), g_SceneDoneFrame,
-                 g_VmSceneFrame);
+    if (target == kAttach) {
+        if (scene && g_AttachSceneSrv) {
+            views[0] = g_AttachSceneSrv;
+            views[2 + kTextures] = g_AttachSceneSrv;
         }
+        for (int i = 0; i < kTextures; ++i) views[1 + i] = prog.tex[i].load(std::memory_order_acquire);
+        views[kFramesView] = frameView;
+        if (depth && g_AttachDepthSrv) views[1 + kTextures] = g_AttachDepthSrv;
+    } else {
+        const bool copies = (scene || depth) && EnsureCopies(c);
+        if (scene && !copies) {   // TEMPORARY diagnostics (2026-11-20): a scene reader with no copy
+            static ULONGLONG s_next = 0;
+            const ULONGLONG nowT = GetTickCount64();
+            if (nowT >= s_next) {
+                s_next = nowT + 500;
+                Logf("WeaponFX: NO SCENE COPY for target %d - run %d predicted %d copiedRun %d inVmRun %d mainRt %d frame %u sceneDone %u vmSceneFrame %u",
+                     target, g_Run, g_PredictedRun, g_CopiedRun, (int)InVmRun(g_Frame.load(std::memory_order_relaxed)),
+                     (int)(g_MainRt && BoundRtResource(c) == g_MainRt), g_Frame.load(std::memory_order_relaxed), g_SceneDoneFrame,
+                     g_VmSceneFrame);
+            }
+        }
+        if (scene && copies) views[0] = g_SceneSrv;
+        if (scene && copies) views[2 + kTextures] = g_PrevSceneSrv;
+        if (scene) NoteWeaponDraw(c, copies, copies && g_EnsureStale);
+        if (scene && g_RingState.load(std::memory_order_relaxed) == 1 && g_MainRt && BoundRtResource(c) == g_MainRt &&
+            g_PredictedRun >= 0 && g_Run >= g_PredictedRun) {
+            const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+            const RingMeta mt = { frame, g_Run, g_PredictedRun, g_CopiedRun, g_LastCopyDraw, (uint32_t)(g_DbgDrawIdx - 1),
+                                  copies, g_SceneDoneFrame == frame };
+            RingRecord(c, copies ? g_SceneSrv : nullptr, mt);
+        }
+        if (g_Trace == 2)
+            Logf("WeaponFX: trace #%d run %d our draw, copies %d, rt %p, scene view %p", g_DbgDrawIdx - 1, g_Run, (int)copies,
+                 BoundRtResource(c), (void*)(copies ? g_SceneSrv : nullptr));
+        for (int i = 0; i < kTextures; ++i) views[1 + i] = prog.tex[i].load(std::memory_order_acquire);
+        views[kFramesView] = frameView;
+        if (depth && copies && g_DepthReady) views[1 + kTextures] = g_DepthSrv;
+        if (depth && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgDepthSrv) views[1 + kTextures] = g_DbgDepthSrv;
+        if (scene && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgSceneSrv) views[0] = g_DbgSceneSrv;
     }
-    if (scene && copies) views[0] = g_SceneSrv;
-    if (scene && copies) views[2 + kTextures] = g_PrevSceneSrv;
-    if (scene) NoteWeaponDraw(c, copies, copies && g_EnsureStale);
-    if (scene && g_RingState.load(std::memory_order_relaxed) == 1 && g_MainRt && BoundRtResource(c) == g_MainRt &&
-        g_PredictedRun >= 0 && g_Run >= g_PredictedRun) {
-        const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
-        const RingMeta mt = { frame, g_Run, g_PredictedRun, g_CopiedRun, g_LastCopyDraw, (uint32_t)(g_DbgDrawIdx - 1),
-                              copies, g_SceneDoneFrame == frame };
-        RingRecord(c, copies ? g_SceneSrv : nullptr, mt);
-    }
-    if (g_Trace == 2)
-        Logf("WeaponFX: trace #%d run %d our draw, copies %d, rt %p, scene view %p", g_DbgDrawIdx - 1, g_Run, (int)copies,
-             BoundRtResource(c), (void*)(copies ? g_SceneSrv : nullptr));
-    for (int i = 0; i < kTextures; ++i) views[1 + i] = prog.tex[i].load(std::memory_order_acquire);
-    views[kFramesView] = frameView;
-    if (depth && copies && g_DepthReady) views[1 + kTextures] = g_DepthSrv;
-    if (depth && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgDepthSrv) views[1 + kTextures] = g_DbgDepthSrv;
-    if (scene && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgSceneSrv) views[0] = g_DbgSceneSrv;
 
     c->PSGetShader(&saved.ps, nullptr, nullptr);
-    g_MarkerPs = saved.ps;
+    if (saved.ps && target != kAttach) g_MarkerPs = saved.ps;
     // The slice, where the context has the 11.1 interface (Windows 8+: always).
     ID3D11DeviceContext1* c1 = nullptr;
     if (SUCCEEDED(c->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1)) && c1) {
@@ -2991,7 +3428,24 @@ bool Begin(ID3D11DeviceContext* c, int target, Bound& saved) {
     c->PSSetShader(ours, nullptr, 0);
     c->PSSetConstantBuffers(kCbSlot, 1, &g_Cb);
     c->PSSetShaderResources(kSceneSlot, kViews, views);
-    c->OMSetBlendState(g_Blend, nullptr, 0xFFFFFFFFu);
+    ID3D11BlendState* useBlend = g_Blend;
+    if (prog.isBuiltin.load(std::memory_order_relaxed) && prog.param[0][3].load(std::memory_order_relaxed) < 0.5f) {
+        if (!g_MulBlend && g_Dev) {
+            D3D11_BLEND_DESC mb = {};
+            D3D11_RENDER_TARGET_BLEND_DESC& rt = mb.RenderTarget[0];
+            rt.BlendEnable = TRUE;
+            rt.SrcBlend = D3D11_BLEND_DEST_COLOR;
+            rt.DestBlend = D3D11_BLEND_ZERO;
+            rt.BlendOp = D3D11_BLEND_OP_ADD;
+            rt.SrcBlendAlpha = D3D11_BLEND_ZERO;
+            rt.DestBlendAlpha = D3D11_BLEND_ONE;
+            rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(g_Dev->CreateBlendState(&mb, &g_MulBlend))) g_MulBlend = nullptr;
+        }
+        if (g_MulBlend) useBlend = g_MulBlend;
+    }
+    c->OMSetBlendState(useBlend, nullptr, 0xFFFFFFFFu);
     saved.on = true;
     return true;
 }
@@ -3019,20 +3473,22 @@ void End(ID3D11DeviceContext* c, Bound& saved) {
 }
 
 namespace {
-bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key);
+bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key,
+               const DrawIndexedArgs* diArgs);
 }
 
-bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key) {
+bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key,
+          const DrawIndexedArgs* diArgs) {
     if (g_SkyInside) { issue(ctx); return false; }
     if (!ValidTarget(target) || !g_Prog[target].ps.load(std::memory_order_relaxed) || c != g_TrackCtx)
-        return DrawInner(c, target, issue, ctx, key);
+        return DrawInner(c, target, issue, ctx, key, diArgs);
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
     const DrawSig sig = SigOf(c, key);
     if (key && g_LastSigFrame == frame && memcmp(&sig, &g_LastSig, sizeof(sig)) == 0) ++g_FrameDups;
     g_LastSig = sig;
     g_LastSigFrame = frame;
     const int t = TimerOpen(c, kTimeDraw);
-    const bool on = DrawInner(c, target, issue, ctx, key);
+    const bool on = DrawInner(c, target, issue, ctx, key, diArgs);
     TimerClose(c, t);
     return on;
 }
@@ -3040,8 +3496,10 @@ bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t
 namespace {
 thread_local bool g_InVmPass = false;   // SetViewmodelPass
 thread_local bool g_InRoPass = false;   // SetRenderObjectsPass
+std::atomic<bool> g_ThirdPerson{false};   // SetThirdPerson
 
-bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key) {
+bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key,
+               const DrawIndexedArgs* diArgs) {
     // A marked draw whose target has no shader (the gloves marked while their
     // shader failed to load) is issued as the engine's own, not with ours.
     bool weapon = ValidTarget(target) && g_Prog[target].ps.load(std::memory_order_relaxed);
@@ -3074,6 +3532,14 @@ bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uin
         }
     }
     Bound fx;
+    if (target == kAttach) {
+        if (weapon) {
+            bool drawn = false;
+            if (DrawAttachment(c, target, issue, ctx, &drawn, diArgs)) return drawn;
+        }
+        issue(ctx);
+        return false;
+    }
     ID3D11DepthStencilView* mainDsv = nullptr;
     // A draw that is not ours and not made inside a viewmodel RenderObjects call
     // is none of the viewmodel's, wherever the run counter stands: the cheat's
@@ -3195,8 +3661,13 @@ bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uin
         c->OMSetRenderTargets(0, nullptr, g_VmDsv);
         c->OMSetDepthStencilState(g_DsPre, 0);
         IssueDepthOnly(c, issue, ctx);
-        c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, g_VmDsv);
-        c->OMSetDepthStencilState(g_DsFx, 0);
+        // The colour is the engine's own, in the main depth and stencil: the cheat's
+        // enemy glow reads them after the viewmodel, and with the colour pass pointed
+        // at our buffer the main ones lacked what the engine writes there and the glow
+        // came out as a haze over the whole enemy. Our buffer gets the depth only, which
+        // is all the weapon (drawn against it) needs of the hands.
+        c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, mainDsv);
+        c->OMSetDepthStencilState(ds, ref);
         issue(ctx);
         c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, mainDsv);
         c->OMSetDepthStencilState(ds, ref);
@@ -3217,19 +3688,37 @@ bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uin
     } else {
         c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, mainDsv);
     }
-    const bool on = weapon && Begin(c, target, fx);
-    // Ours tests against the depth pass it just laid down (equal passes), or
-    // only against the hands for a scene reader; theirs keep their own state,
-    // stencil included.
-    // The engine's own passes of the weapon under a scene reader write no
-    // depth either. With the weapon kept (overlay mode) its skin pass
-    // writes it, the hand drawn after it then failed behind the weapon, and
-    // the see-through window showed the black the copy holds there (no world
-    // behind a hand, no hand yet).
-    const bool quiet = weaponPass && writes && AnyScene();
-    c->OMSetDepthStencilState(on || quiet ? g_DsFx : ds, on || quiet ? 0 : ref);
-    issue(ctx);
-    End(c, fx);
+    const bool isWire = weapon && ValidTarget(target) &&
+                        g_Prog[target].isBuiltin.load(std::memory_order_relaxed) &&
+                        g_Prog[target].param[0][3].load(std::memory_order_relaxed) >= 6.5f;
+    const float wireAlpha = isWire ? g_Prog[target].param[1][0].load(std::memory_order_relaxed) : 1.0f;
+    bool on = false;
+    if (isWire) {
+        ID3D11RasterizerState* savedRs = nullptr;
+        c->RSGetState(&savedRs);
+        if (wireAlpha >= 0.995f) {
+            g_Prog[target].param[0][3].store(8.0f, std::memory_order_relaxed);
+            Bound fxBase;
+            const bool baseOn = Begin(c, target, fxBase);
+            c->OMSetDepthStencilState(baseOn ? g_DsFx : ds, baseOn ? 0 : ref);
+            if (baseOn) issue(ctx);
+            End(c, fxBase);
+            g_Prog[target].param[0][3].store(7.0f, std::memory_order_relaxed);
+        }
+        if (ID3D11RasterizerState* wrs = WireframeState()) c->RSSetState(wrs);
+        on = Begin(c, target, fx);
+        c->OMSetDepthStencilState(on ? g_DsFx : ds, on ? 0 : ref);
+        issue(ctx);
+        End(c, fx);
+        c->RSSetState(savedRs);
+        if (savedRs) savedRs->Release();
+    } else {
+        on = weapon && Begin(c, target, fx);
+        const bool quiet = weaponPass && writes && AnyScene();
+        c->OMSetDepthStencilState(on || quiet ? g_DsFx : ds, on || quiet ? 0 : ref);
+        issue(ctx);
+        End(c, fx);
+    }
     c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, mainDsv);
     c->OMSetDepthStencilState(ds, ref);
     for (ID3D11RenderTargetView* v : rtv)
@@ -3250,6 +3739,8 @@ unsigned DebugBits() { return g_DebugBits.load(std::memory_order_relaxed); }
 
 void SetViewmodelPass(bool on) { g_InVmPass = on; }
 void SetRenderObjectsPass(bool on) { g_InRoPass = on; }
+void SetThirdPerson(bool on) { g_ThirdPerson.store(on, std::memory_order_relaxed); }
+bool InAttachmentPass() { return g_ThirdPerson.load(std::memory_order_relaxed); }
 
 void SetViewmodelDepth(bool on) {
     g_VmDepthOn.store(on, std::memory_order_relaxed);

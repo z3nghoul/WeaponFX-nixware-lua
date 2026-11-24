@@ -17,7 +17,7 @@ using WeaponFx::kWeapon;
 using WeaponFx::kGloves;
 
 constexpr char kFile[] = "weaponfx.ini";
-const char* const kDefaultOf[kTargets] = { "default", "gloves", "hands", "sleeves" };
+const char* const kDefaultOf[kTargets] = { "default", "gloves", "hands", "sleeves", "attachments" };
 constexpr char kGlovePrefix[] = "glove_";
 constexpr ULONGLONG kFileCheckMs = 300;
 constexpr int kMaxWriteKeys = 16;
@@ -132,6 +132,10 @@ const char* ModeName(Engine::Mode m) {
 void Resolve(const char* in, char* out, size_t cap) {
     out[0] = 0;
     if (!in[0]) return;
+    if (strncmp(in, "builtin:", 8) == 0) {
+        strncpy_s(out, cap, in, _TRUNCATE);
+        return;
+    }
     DataPath(in, out, (unsigned)cap);
 }
 
@@ -229,6 +233,7 @@ int TargetOf(const char* section) {
         return kGloves;
     if (!_stricmp(section, kDefaultOf[WeaponFx::kHands])) return WeaponFx::kHands;
     if (!_stricmp(section, kDefaultOf[WeaponFx::kSleeves])) return WeaponFx::kSleeves;
+    if (!_stricmp(section, kDefaultOf[WeaponFx::kAttach])) return WeaponFx::kAttach;
     return kWeapon;
 }
 

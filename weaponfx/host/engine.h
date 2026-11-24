@@ -44,6 +44,10 @@ bool Handle(RenderObjectsFn orig, void* p1, void* p2, void* items, int count, vo
 // marker exists. Lets a host skip the call (and its reads) when idle.
 bool Wanted();
 
+// The entity indices of what the local player owns (weapons and grenades on its body).
+// Their items in the world view are the attachments target's. Empty list: none. Any thread.
+void SetAttachments(const unsigned* indices, int n);
+
 // `target` is a WeaponFx::Target.
 void SetMode(int target, Mode m);
 Mode GetMode(int target);

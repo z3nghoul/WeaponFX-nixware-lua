@@ -149,6 +149,8 @@ using WeaponFx::kTargets;
 
 // Per target, the marker texture's two views (linear, sRGB).
 std::atomic<ID3D11ShaderResourceView*> g_MarkerA[kTargets] = {}, g_MarkerB[kTargets] = {};
+// Second texture's views for kAttach (g_tColor2), paired with g_MarkerA/B[kAttach] (g_tColor).
+std::atomic<ID3D11ShaderResourceView*> g_Attach2A{nullptr}, g_Attach2B{nullptr};
 std::atomic<unsigned> g_Draws{0}, g_Marked{0}, g_MarkedGloves{0};
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -216,6 +218,10 @@ int MarkerBound(ID3D11DeviceContext* c, UINT indexCount) {
         mix = mix * 31 + (uintptr_t)a[t] * 7 + (uintptr_t)b[t];
         any = any || a[t] || b[t];
     }
+    ID3D11ShaderResourceView* const a2 = g_Attach2A.load(std::memory_order_relaxed);
+    ID3D11ShaderResourceView* const b2 = g_Attach2B.load(std::memory_order_relaxed);
+    mix = mix * 31 + (uintptr_t)a2 * 7 + (uintptr_t)b2;
+    any = any || a2 || b2;
     if (!any) return WeaponFx::kNone;
     if (g_SpanFor != mix) { g_SpanFor = mix; g_MarkerSpan = 0; }
     UINT lo = 0, cnt = 16;
@@ -229,35 +235,35 @@ int MarkerBound(ID3D11DeviceContext* c, UINT indexCount) {
     ID3D11ShaderResourceView* srv[16] = {};
     c->PSGetShaderResources(lo, cnt, srv);
     unsigned masks[kTargets] = {};
+    unsigned maskAttach2 = 0;
     for (unsigned k = 0; k < cnt; ++k) {
-        if (srv[k])
+        if (srv[k]) {
             for (int t = 0; t < kTargets; ++t)
                 if (srv[k] == a[t] || srv[k] == b[t]) masks[t] |= 1u << (lo + k);
+            if (srv[k] == a2 || srv[k] == b2) maskAttach2 |= 1u << (lo + k);
+        }
         if (srv[k]) srv[k]->Release();
     }
-    // The marker material binds its texture twice (g_tColor and g_tColor2,
-    // host/material.cpp), so the weapon's draws carry it in two slots (13 and
-    // 14 on 2026-10 builds). A draw with it in one slot inherited a stale
-    // binding: D3D11 keeps a slot until something rebinds it, and the muzzle
-    // flash and smoke quads drawn right after the weapon rebind 13 but not 14.
-    // Taken for the weapon they were painted with the effect.
+    // The marker material binds two textures (g_tColor and g_tColor2, host/material.cpp).
+    // For viewmodel targets both slots carry that target's own texture (2 bits in masks[t]).
+    // For kAttach, g_tColor and g_tColor2 carry two distinct textures (masks[kAttach] and
+    // maskAttach2 each have a bit in a different slot), so attachments never collide with
+    // kWeapon even during a 1st<->3rd person transition.
     int who = WeaponFx::kNone;
     static ID3D11PixelShader* s_markerPs = nullptr;
     for (int t = 0; t < kTargets; ++t) {
-        const unsigned mask = masks[t];
+        unsigned mask = masks[t];
+        bool matched = false;
+        if (t == WeaponFx::kAttach) {
+            mask = masks[t] | maskAttach2;
+            matched = masks[t] != 0 && maskAttach2 != 0 && (mask & (mask - 1)) != 0;
+        } else {
+            matched = (mask & (mask - 1)) != 0;
+        }
         if (!mask) continue;
         g_MarkerSpan |= mask;
-        if (who < 0 && (mask & (mask - 1)) != 0) {         // two bits or more
-            // A viewmodel mesh has hundreds of indices at least (the gloves
-            // ~14000). The full-screen post-process quads (6 indices) drawn
-            // after the viewmodel inherit both marker slots when nothing
-            // rebinds them - seen once a gloves effect was on - and taking
-            // them for the viewmodel paints the whole frame with it.
+        if (who < 0 && matched) {
             if (indexCount < kMinMarkedIndices) { NotePair(c, mask, indexCount, true); continue; }
-            // Also verify the bound Pixel Shader matches the marker material's
-            // csgo_unlitgeneric PS: enemy chams or depth passes drawn after the
-            // viewmodel can have >36 indices and inherit slots 13-14 when their
-            // own shader binds no textures there.
             ID3D11PixelShader* ps = nullptr;
             c->PSGetShader(&ps, nullptr, nullptr);
             if (ps) ps->Release();
@@ -317,7 +323,8 @@ void STDMETHODCALLTYPE HkDii(ID3D11DeviceContext* c, UINT n, UINT inst, UINT s, 
         ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT))g_Det[kDii][S].orig)(c, n, inst,
                                                                                                          s, b, si);
     };
-    WeaponFx::Draw(c, target, &CallIssue<decltype(issue)>, &issue, key);
+    const WeaponFx::DrawIndexedArgs diArgs = { n, inst, s, b, si };
+    WeaponFx::Draw(c, target, &CallIssue<decltype(issue)>, &issue, key, &diArgs);
 }
 
 template <int S>
@@ -595,8 +602,14 @@ void SetMarkerViews(int target, ID3D11ShaderResourceView* a, ID3D11ShaderResourc
     g_MarkerB[target].store(b, std::memory_order_relaxed);
 }
 
+void SetAttachMarkerViews2(ID3D11ShaderResourceView* a, ID3D11ShaderResourceView* b) {
+    g_Attach2A.store(a, std::memory_order_relaxed);
+    g_Attach2B.store(b, std::memory_order_relaxed);
+}
+
 void ClearMarkerViews() {
     for (int t = 0; t < kTargets; ++t) SetMarkerViews(t, nullptr, nullptr);
+    SetAttachMarkerViews2(nullptr, nullptr);
 }
 
 bool Hooked() {

@@ -34,8 +34,12 @@ using LogFn = void (*)(const char* line);
 // Whose a draw is. kNone: not ours to paint (still counted by the pipeline).
 // The weapon, the gloves, the hands (the bare arm: skin) and the sleeves - the same four
 // parts the cheat's own viewmodel chams tell apart.
-enum Target : int { kNone = -1, kWeapon = 0, kGloves = 1, kHands = 2, kSleeves = 3 };
-constexpr int kTargets = 4;
+// kAttach: the local player's own attachments on the body (the grenades on the belt, the
+// holstered pistol, the weapon on the back and in the hand) in the world view. It has no
+// marker of its own: its items carry the weapon's marker, and the draws made inside the
+// third-person flag (SetThirdPerson) are told apart by that.
+enum Target : int { kNone = -1, kWeapon = 0, kGloves = 1, kHands = 2, kSleeves = 3, kAttach = 4 };
+constexpr int kTargets = 5;
 
 // Our constant buffer's register. The engine's weapon PS uses b0..b5; the
 // top slot is the one least likely to collide with a future combo. Restored
@@ -124,12 +128,20 @@ bool SetFrames(int target, ID3D11ShaderResourceView* frames, float fps);
 // call it twice (a depth-only pass first), so it must not have side effects
 // beyond the draw.
 using IssueFn = void (*)(void* ctx);
+struct DrawIndexedArgs {
+    unsigned indexCount;
+    unsigned instanceCount;
+    unsigned startIndex;
+    int baseVertex;
+    unsigned startInstance;
+};
 // Issues a draw BeforeDraw let through: with `target`'s shader when it is a
 // marked one (Begin/End around it), and inside the viewmodel run against our
 // viewmodel depth (SetViewmodelDepth). True when our shader drew it.
 // `key`: the draw's own arguments mixed into one number by the host (0 = none),
 // only to tell an exact repeat of the previous weapon draw in the GPU cost line.
-bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key = 0);
+bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key = 0,
+          const DrawIndexedArgs* diArgs = nullptr);
 // Viewmodel depth (on by default). The see-through setup takes the weapon out
 // of the engine's depth passes and draws it without a depth test, so it lands
 // on top of the fingers and of its own far side. With this on, every draw of
@@ -151,6 +163,12 @@ void SetViewmodelPass(bool on);
 // outside every RenderObjects call (the weapon's other paths) are treated as
 // the viewmodel's while its run lasts.
 void SetRenderObjectsPass(bool on);
+// The camera is in third person (set by the script, every frame). The draws are not made
+// inside the RenderObjects call that marked them (they run after it returns), so a draw
+// cannot be tied to the call: instead, in third person there is no viewmodel, and a draw
+// with the weapon's marker is one of the local player's attachments (kAttach's).
+void SetThirdPerson(bool on);
+bool InAttachmentPass();
 
 // Saved engine state between Begin and End.
 struct Bound {

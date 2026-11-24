@@ -183,7 +183,7 @@ void SetTexExtra(TexExtraFn fn) { g_TexExtra = fn; }
 void Draw() {
     for (int t = 0; t < kTargets; ++t) Sync(t);
     if (ImGui::BeginTabBar("wfx_targets")) {
-        const char* names[kTargets] = { T("Weapon"), T("Gloves"), T("Hands"), T("Sleeves") };
+        const char* names[kTargets] = { T("Weapon"), T("Gloves"), T("Hands"), T("Sleeves"), T("Attachments") };
         for (int t = 0; t < kTargets; ++t) {
             if (!ImGui::BeginTabItem(names[t])) continue;
             if (g_Tab != t) {

@@ -38,13 +38,22 @@ const char kMarkerKv3Fmt[] =
 // base game **[fragile: a map that drew with one would get that target's
 // effect on its surfaces]**.
 const char* const kMarkerTexture[kTargets] = {
-    "materials/dev/black_grid_8_color_tga_dd8b6813.vtex",   // the weapon
-    "materials/dev/gray_grid_8_color_tga_2bcb1c0a.vtex",    // the gloves
-    "materials/dev/reflectivity_50b_color_tga_a4535897.vtex",   // the hands
-    "materials/dev/reflectivity_90_color_tga_e6243a0e.vtex",    // the sleeves
+    "materials/dev/black_grid_8_color_tga_dd8b6813.vtex",     // the weapon
+    "materials/dev/gray_grid_8_color_tga_2bcb1c0a.vtex",      // the gloves
+    "materials/dev/reflectivity_50b_color_tga_a4535897.vtex", // the hands
+    "materials/dev/reflectivity_90_color_tga_e6243a0e.vtex",  // the sleeves
+    "materials/dev/black_grid_8_color_tga_dd8b6813.vtex",     // the attachments (paired with gray_grid_8 in g_tColor2)
+};
+const char* const kMarkerTexture2[kTargets] = {
+    "materials/dev/black_grid_8_color_tga_dd8b6813.vtex",     // the weapon
+    "materials/dev/gray_grid_8_color_tga_2bcb1c0a.vtex",      // the gloves
+    "materials/dev/reflectivity_50b_color_tga_a4535897.vtex", // the hands
+    "materials/dev/reflectivity_90_color_tga_e6243a0e.vtex",  // the sleeves
+    "materials/dev/gray_grid_8_color_tga_2bcb1c0a.vtex",      // the attachments
 };
 constexpr ULONGLONG kLoadWaitMs = 500;   // the request is not blocking; give it a moment
 constexpr char kMarkerParam[] = "g_tColor";
+constexpr char kMarkerParam2[] = "g_tColor2";
 
 // materialsystem2!CreateMaterial(this-less, CStrongHandle* out, name, kv3, flags, flags).
 constexpr short kSigCreateMaterial[] = {
@@ -186,11 +195,13 @@ bool Resolve() {
 }
 
 void* Marker(int target) {
-    if (target < 0 || target >= kTargets) return nullptr;
+    if (target < 0 || target >= kTargets || !kMarkerTexture[target]) return nullptr;
     if (void* m = g_Marker[target].load(std::memory_order_acquire)) return m;
     if (g_Tried[target]) return nullptr;
     if (!g_CreateAt[target]) {
         RequestTexture(kMarkerTexture[target]);
+        if (kMarkerTexture2[target] && strcmp(kMarkerTexture2[target], kMarkerTexture[target]) != 0)
+            RequestTexture(kMarkerTexture2[target]);
         g_CreateAt[target] = GetTickCount64() + kLoadWaitMs;
         return nullptr;
     }
@@ -198,7 +209,8 @@ void* Marker(int target) {
     g_Tried[target] = true;   // one attempt per load: a failure is logged, not retried every frame
     if (!Resolve()) return nullptr;
     char text[sizeof(kMarkerKv3Fmt) + 256];
-    _snprintf_s(text, sizeof(text), _TRUNCATE, kMarkerKv3Fmt, kMarkerTexture[target], kMarkerTexture[target]);
+    _snprintf_s(text, sizeof(text), _TRUNCATE, kMarkerKv3Fmt, kMarkerTexture[target],
+                kMarkerTexture2[target] ? kMarkerTexture2[target] : kMarkerTexture[target]);
     void* kv = LoadKv3(text);
     if (!kv) return nullptr;
     // A name per load: a second load in the same game session must not get
@@ -225,7 +237,10 @@ void* MarkerIfReady(int target) {
     return target >= 0 && target < kTargets ? g_Marker[target].load(std::memory_order_acquire) : nullptr;
 }
 
-void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b) {
+namespace {
+
+void MarkerViewsForParam(int target, const char* param, size_t paramBytes, ID3D11ShaderResourceView** a,
+                         ID3D11ShaderResourceView** b) {
     *a = *b = nullptr;
     void* mat = MarkerIfReady(target);
     if (!mat) return;
@@ -238,9 +253,10 @@ void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceV
     for (uint32_t i = 0; i < count; ++i) {
         const uintptr_t rec = (uintptr_t)block + (size_t)i * kParamStride;
         void* np = nullptr;
-        char name[sizeof(kMarkerParam) + 1] = {};
-        if (!ReadPtr(rec + kParamName, &np) || !np || !ReadMem((uintptr_t)np, name, sizeof(kMarkerParam))) continue;
-        if (memcmp(name, kMarkerParam, sizeof(kMarkerParam)) != 0) continue;   // includes the terminator
+        char name[32] = {};
+        if (paramBytes > sizeof(name)) return;
+        if (!ReadPtr(rec + kParamName, &np) || !np || !ReadMem((uintptr_t)np, name, paramBytes)) continue;
+        if (memcmp(name, param, paramBytes) != 0) continue;   // includes the terminator
         void* binding = nullptr;
         void* tex = nullptr;
         void* va = nullptr;
@@ -252,6 +268,16 @@ void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceV
         *b = (ID3D11ShaderResourceView*)vb;
         return;
     }
+}
+
+} // namespace
+
+void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b) {
+    MarkerViewsForParam(target, kMarkerParam, sizeof(kMarkerParam), a, b);
+}
+
+void MarkerViews2(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b) {
+    MarkerViewsForParam(target, kMarkerParam2, sizeof(kMarkerParam2), a, b);
 }
 
 } // namespace Material

@@ -28,6 +28,8 @@ void* MarkerIfReady(int target);
 // (streaming), and a stale pointer would lose the weapon. Null when not
 // readable. Compared, never called through.
 void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b);
+// The second texture's views (g_tColor2), used by targets whose marker pairs two distinct textures (kAttach).
+void MarkerViews2(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b);
 
 } // namespace Material
 } // namespace Wfx
